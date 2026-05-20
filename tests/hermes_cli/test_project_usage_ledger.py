@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,40 @@ def test_get_task_rollups_finds_specific_task_beyond_summary_limit(usage_home):
     assert rows[0]["task_id"] == "t-0"
     assert rows[0]["input_tokens"] == 1
 
+
+
+def test_backfill_records_board_query_error_without_aborting(usage_home, monkeypatch):
+    _seed_session(usage_home, "sess-board-error", in_tok=21, out_tok=8, cost=0.004)
+    _seed_completed_run("sess-board-error")
+    real_connect = kb.connect
+
+    class FlakyConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if "FROM task_runs" in sql:
+                raise sqlite3.OperationalError("synthetic task_runs failure")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._conn.close()
+
+    def fake_connect(*args, board=None, **kwargs):
+        conn = real_connect(*args, board=board, **kwargs)
+        if board == "default":
+            return FlakyConn(conn)
+        return conn
+
+    monkeypatch.setattr(usage.kanban_db, "connect", fake_connect)
+
+    data = usage.get_summary(refresh=True)
+
+    assert data["last_backfill_error"]
+    assert "default: synthetic task_runs failure" in data["last_backfill_error"]
+    # The skipped board should not abort the whole backfill; raw sessions remain visible.
+    assert data["totals"]["input_tokens"] == 21
+    assert any(b["board_slug"] == "__unassigned__" for b in data["boards"])
 
 def test_project_usage_summary_keeps_unassigned_sessions_visible(usage_home):
     _seed_session(usage_home, "sess-unassigned", in_tok=11, out_tok=22, cost=0.003)
