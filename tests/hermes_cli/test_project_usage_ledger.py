@@ -229,7 +229,7 @@ def test_kanban_usage_cli_outputs_json_summary(usage_home):
     _seed_session(usage_home, "sess-cli", in_tok=13, out_tok=17, cost=0.0042)
     tid = _seed_completed_run("sess-cli", title="cli usage task")
 
-    out = kc.run_slash("usage --json")
+    out = kc.run_slash("usage --refresh --json")
     data = json.loads(out)
 
     assert data["totals"]["input_tokens"] == 13

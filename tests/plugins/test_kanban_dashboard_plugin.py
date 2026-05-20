@@ -2367,3 +2367,46 @@ def test_dashboard_bundle_renders_usage_badge():
     assert "function taskUsageTokens(t)" in js
     assert "hermes-kanban-usage" in js
     assert "estimated cost" in js
+
+
+def test_board_usage_rollup_dedupes_sessionless_snapshots_by_latest(client, kanban_home):
+    """Session-less cumulative snapshots should not double count older rows."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="sessionless usage snapshot", assignee="worker")
+        assert kb.claim_task(conn, tid)
+        now = int(time.time())
+        for ended_at, tokens in ((now, 7), (now + 1000, 11)):
+            conn.execute(
+                """
+                INSERT INTO task_runs(
+                    task_id, profile, status, started_at, ended_at, outcome,
+                    summary, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tid,
+                    "worker",
+                    "completed",
+                    ended_at - 10,
+                    ended_at,
+                    "done",
+                    "sessionless snapshot",
+                    json.dumps({
+                        "usage_snapshot": {
+                            "input_tokens": tokens,
+                            "output_tokens": 1,
+                            "reasoning_tokens": 0,
+                            "estimated_cost_usd": 0.001 * tokens,
+                        },
+                    }),
+                ),
+            )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    tasks = [task for col in r.json()["columns"] for task in col["tasks"]]
+    card = next(t for t in tasks if t["id"] == tid)
+    assert card["usage"]["input_tokens"] == 11
+    assert card["usage"]["output_tokens"] == 1
+    assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.011)
