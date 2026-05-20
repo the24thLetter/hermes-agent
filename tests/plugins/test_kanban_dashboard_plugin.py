@@ -2409,4 +2409,5 @@ def test_board_usage_rollup_dedupes_sessionless_snapshots_by_latest(client, kanb
     card = next(t for t in tasks if t["id"] == tid)
     assert card["usage"]["input_tokens"] == 11
     assert card["usage"]["output_tokens"] == 1
+    assert card["usage"]["sessions"] == 1
     assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.011)
