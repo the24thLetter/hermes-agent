@@ -210,6 +210,7 @@ def _usage_from_run_snapshots(board_slug: Optional[str], task_ids: list[str]) ->
             SELECT task_id, metadata
             FROM task_runs
             WHERE task_id IN ({placeholders})
+            ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
             """,
             list(task_ids),
         ).fetchall()
