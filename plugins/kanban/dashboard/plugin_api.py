@@ -257,8 +257,8 @@ def _usage_from_run_snapshots(board_slug: Optional[str], task_ids: list[str]) ->
         for key in ("estimated_cost_usd", "actual_cost_usd"):
             agg[key] += float(snapshot.get(key) or 0.0)
     for agg in out.values():
-        agg["sessions"] = len(agg.pop("_session_ids"))
-        agg.pop("_sessionless_seen", None)
+        sessionless_seen = bool(agg.pop("_sessionless_seen", False))
+        agg["sessions"] = len(agg.pop("_session_ids")) + (1 if sessionless_seen else 0)
     return out
 
 
