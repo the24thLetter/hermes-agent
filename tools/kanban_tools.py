@@ -118,15 +118,19 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
-    """Add trusted worker session id metadata for this worker's own task."""
+    """Add trusted worker session id + token usage metadata for this worker."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
         return metadata
-    stamped = dict(metadata or {})
-    stamped["worker_session_id"] = session_id
-    return stamped
+    try:
+        from hermes_cli.project_usage_ledger import stamp_usage_metadata
+        return stamp_usage_metadata(metadata, session_id)
+    except Exception:
+        stamped = dict(metadata or {})
+        stamped["worker_session_id"] = session_id
+        return stamped
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -528,10 +532,12 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            metadata = _stamp_worker_session_metadata(tid, None)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
