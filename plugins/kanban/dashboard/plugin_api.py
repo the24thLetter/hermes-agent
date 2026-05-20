@@ -186,6 +186,32 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
     }
 
 
+def _usage_by_task(board_slug: Optional[str], task_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not task_ids:
+        return {}
+    try:
+        from hermes_cli import project_usage_ledger as usage
+        summary = usage.get_summary(board=board_slug, refresh=True)
+    except Exception as exc:
+        log.debug("kanban usage rollup unavailable: %s", exc)
+        return {}
+    wanted = set(task_ids)
+    out: dict[str, dict[str, Any]] = {}
+    for row in summary.get("tasks") or []:
+        tid = row.get("task_id")
+        if tid in wanted:
+            out[str(tid)] = {
+                "runs": row.get("runs", 0),
+                "sessions": row.get("sessions", 0),
+                "input_tokens": row.get("input_tokens", 0),
+                "output_tokens": row.get("output_tokens", 0),
+                "reasoning_tokens": row.get("reasoning_tokens", 0),
+                "estimated_cost_usd": row.get("estimated_cost_usd", 0.0),
+                "actual_cost_usd": row.get("actual_cost_usd", 0.0),
+            }
+    return out
+
+
 def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     """Serialise a Run for the drawer's Run history section."""
     return {
@@ -431,7 +457,9 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        usage_map = _usage_by_task(board or kanban_db.get_current_board(), task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -442,6 +470,10 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            d["usage"] = usage_map.get(t.id, {
+                "runs": 0, "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "reasoning_tokens": 0, "estimated_cost_usd": 0.0, "actual_cost_usd": 0.0,
+            })
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -1629,6 +1661,24 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Usage (token/cost rollups from the project usage ledger)
+# ---------------------------------------------------------------------------
+
+@router.get("/usage")
+def get_usage(
+    board: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    refresh: bool = Query(True),
+):
+    board = _resolve_board(board)
+    try:
+        from hermes_cli import project_usage_ledger as usage
+        return usage.get_summary(board=board, task_id=task_id, refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"usage summary failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
