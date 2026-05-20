@@ -2301,17 +2301,17 @@ def test_board_usage_rollup_reads_fresh_task_run_snapshots(client, kanban_home):
                 "worker",
                 "completed",
                 10,
-                20,
+                int(time.time()) + 1000,
                 "retry",
-                "duplicate cumulative snapshot",
+                "newer cumulative snapshot",
                 json.dumps({
                     "worker_session_id": "sess-snapshot-card",
                     "usage_snapshot": {
                         "session_id": "sess-snapshot-card",
-                        "input_tokens": 55,
-                        "output_tokens": 89,
-                        "reasoning_tokens": 13,
-                        "estimated_cost_usd": 0.015,
+                        "input_tokens": 60,
+                        "output_tokens": 90,
+                        "reasoning_tokens": 14,
+                        "estimated_cost_usd": 0.016,
                     },
                 }),
             ),
@@ -2321,10 +2321,10 @@ def test_board_usage_rollup_reads_fresh_task_run_snapshots(client, kanban_home):
     assert r.status_code == 200, r.text
     tasks = [task for col in r.json()["columns"] for task in col["tasks"]]
     card = next(t for t in tasks if t["id"] == tid)
-    assert card["usage"]["input_tokens"] == 55
-    assert card["usage"]["output_tokens"] == 89
-    assert card["usage"]["reasoning_tokens"] == 13
-    assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.015)
+    assert card["usage"]["input_tokens"] == 60
+    assert card["usage"]["output_tokens"] == 90
+    assert card["usage"]["reasoning_tokens"] == 14
+    assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.016)
 
 
 def test_usage_route_returns_board_filtered_summary(client, kanban_home):

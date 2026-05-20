@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -3261,6 +3262,20 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
             f"Expected 'stale' event in task_events; got {kinds!r}"
         )
 
+
+def test_block_ready_task_with_metadata_synthesizes_run(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="metadata-only block")
+        assert kb.block_task(conn, tid, metadata={"worker_session_id": "sess-block"})
+        rows = conn.execute(
+            "SELECT status, outcome, metadata FROM task_runs WHERE task_id = ?",
+            (tid,),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "blocked"
+    assert rows[0]["outcome"] == "blocked"
+    assert json.loads(rows[0]["metadata"])["worker_session_id"] == "sess-block"
 
 # ---------------------------------------------------------------------------
 # Corruption guard (issue #30687)
