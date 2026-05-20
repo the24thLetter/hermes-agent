@@ -2195,3 +2195,84 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+def test_board_cards_include_usage_rollup(client, kanban_home):
+    """Board cards expose per-task token/cost rollups from the usage ledger."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(kanban_home / "state.db")
+    try:
+        db.create_session("sess-card-usage", "kanban", model="gpt-test")
+        db.update_token_counts(
+            "sess-card-usage",
+            input_tokens=21,
+            output_tokens=34,
+            reasoning_tokens=5,
+            estimated_cost_usd=0.007,
+            absolute=True,
+        )
+    finally:
+        db.close()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="usage badge", assignee="worker")
+        assert kb.claim_task(conn, tid)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="done",
+            metadata={"worker_session_id": "sess-card-usage"},
+        )
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    tasks = [task for col in r.json()["columns"] for task in col["tasks"]]
+    card = next(t for t in tasks if t["id"] == tid)
+
+    assert card["usage"]["input_tokens"] == 21
+    assert card["usage"]["output_tokens"] == 34
+    assert card["usage"]["reasoning_tokens"] == 5
+    assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.007)
+
+
+def test_usage_route_returns_board_filtered_summary(client, kanban_home):
+    from hermes_state import SessionDB
+
+    db = SessionDB(kanban_home / "state.db")
+    try:
+        db.create_session("sess-route", "kanban", model="gpt-test")
+        db.update_token_counts(
+            "sess-route",
+            input_tokens=8,
+            output_tokens=9,
+            estimated_cost_usd=0.002,
+            absolute=True,
+        )
+    finally:
+        db.close()
+
+    with kb.connect(board="default") as conn:
+        tid = kb.create_task(conn, title="route usage", assignee="worker")
+        assert kb.claim_task(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="done", metadata={"worker_session_id": "sess-route"}
+        )
+
+    r = client.get(f"/api/plugins/kanban/usage?board=default&task_id={tid}")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["totals"]["input_tokens"] == 8
+    assert [b["board_slug"] for b in data["boards"]] == ["default"]
+    assert data["tasks"][0]["task_id"] == tid
+    assert data["runs"][0]["session_id"] == "sess-route"
+
+
+def test_dashboard_bundle_renders_usage_badge():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "function taskUsageTokens(t)" in js
+    assert "hermes-kanban-usage" in js
+    assert "estimated cost" in js
