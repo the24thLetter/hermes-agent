@@ -74,6 +74,41 @@ def test_project_usage_backfill_correlates_kanban_run_to_session(usage_home):
     assert data["runs"][0]["session_id"] == "sess-usage-1"
 
 
+def test_project_usage_backfill_counts_session_usage_once_across_runs(usage_home):
+    _seed_session(usage_home, "sess-retry", in_tok=100, out_tok=50, cost=0.0123)
+    tid = _seed_completed_run("sess-retry")
+    with kb.connect(board="default") as conn:
+        conn.execute(
+            """
+            INSERT INTO task_runs(
+                task_id, profile, status, started_at, ended_at, outcome,
+                summary, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tid,
+                "worker",
+                "completed",
+                10,
+                20,
+                "done",
+                "retry terminal row",
+                json.dumps({"worker_session_id": "sess-retry"}),
+            ),
+        )
+
+    data = usage.get_summary(board="default", task_id=tid, refresh=True)
+
+    assert data["totals"]["entries"] == 2
+    assert data["totals"]["sessions"] == 1
+    assert data["totals"]["input_tokens"] == 100
+    assert data["totals"]["output_tokens"] == 50
+    assert data["totals"]["estimated_cost_usd"] == pytest.approx(0.0123)
+    assert data["tasks"][0]["runs"] == 2
+    assert data["tasks"][0]["sessions"] == 1
+    assert data["tasks"][0]["input_tokens"] == 100
+
+
 def test_project_usage_summary_keeps_unassigned_sessions_visible(usage_home):
     _seed_session(usage_home, "sess-unassigned", in_tok=11, out_tok=22, cost=0.003)
 
