@@ -3021,8 +3021,8 @@ def block_task(
             metadata=metadata,
         )
         # Synthesize a run when blocking a never-claimed task so the
-        # reason is preserved in attempt history.
-        if run_id is None and reason:
+        # reason/metadata is preserved in attempt history.
+        if run_id is None and (reason or metadata):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="blocked",
