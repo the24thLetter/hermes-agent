@@ -191,7 +191,9 @@ def _usage_by_task(board_slug: Optional[str], task_ids: list[str]) -> dict[str, 
         return {}
     try:
         from hermes_cli import project_usage_ledger as usage
-        summary = usage.get_summary(board=board_slug, refresh=True)
+        summary = usage.get_summary(board=board_slug, refresh=False)
+        if summary.get("last_backfill_at") is None:
+            summary = usage.get_summary(board=board_slug, refresh=True)
     except Exception as exc:
         log.debug("kanban usage rollup unavailable: %s", exc)
         return {}

@@ -2236,6 +2236,45 @@ def test_board_cards_include_usage_rollup(client, kanban_home):
     assert card["usage"]["estimated_cost_usd"] == pytest.approx(0.007)
 
 
+def test_board_usage_rollup_does_not_refresh_when_ledger_exists(monkeypatch):
+    """Board loads should not trigger full cross-board usage backfills repeatedly."""
+    import hermes_cli
+
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_usage_refresh_test", plugin_file,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    refresh_calls: list[bool] = []
+
+    class FakeUsage:
+        def get_summary(self, *, board=None, refresh=True):
+            refresh_calls.append(refresh)
+            return {
+                "last_backfill_at": 123.0,
+                "tasks": [{
+                    "task_id": "t1",
+                    "runs": 1,
+                    "sessions": 1,
+                    "input_tokens": 3,
+                    "output_tokens": 5,
+                    "reasoning_tokens": 0,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.0,
+                }],
+            }
+
+    monkeypatch.setattr(hermes_cli, "project_usage_ledger", FakeUsage(), raising=False)
+
+    assert mod._usage_by_task("default", ["t1"])["t1"]["input_tokens"] == 3
+    assert refresh_calls == [False]
+
+
 def test_usage_route_returns_board_filtered_summary(client, kanban_home):
     from hermes_state import SessionDB
 
