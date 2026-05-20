@@ -227,6 +227,7 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
     run_entries = 0
     linked_sessions: set[str] = set()
     counted_task_session_usage: set[tuple[str, str]] = set()
+    board_errors: list[str] = []
 
     if not state_path.exists():
         lconn.execute("INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)", (f"missing state db: {state_path}",))
@@ -247,6 +248,8 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
                 kanban_db.init_db(board=slug)
                 kconn = kanban_db.connect(board=slug)
             except Exception as exc:
+                msg = f"{slug}: {exc}"
+                board_errors.append(msg)
                 log.warning("project usage backfill skipped board %s: %s", slug, exc)
                 continue
             try:
@@ -303,6 +306,10 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
                         "backfilled_at": now,
                     })
                     run_entries += 1
+            except Exception as exc:
+                msg = f"{slug}: {exc}"
+                board_errors.append(msg)
+                log.warning("project usage backfill skipped board %s: %s", slug, exc)
             finally:
                 kconn.close()
 
@@ -342,7 +349,13 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
             "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_at', ?)",
             (str(now),),
         )
-        lconn.execute("DELETE FROM ledger_meta WHERE key = 'last_backfill_error'")
+        if board_errors:
+            lconn.execute(
+                "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)",
+                ("; ".join(board_errors),),
+            )
+        else:
+            lconn.execute("DELETE FROM ledger_meta WHERE key = 'last_backfill_error'")
         return {
             "session_entries": session_entries,
             "run_entries": run_entries,
