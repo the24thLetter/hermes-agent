@@ -239,6 +239,7 @@ def _usage_from_run_snapshots(board_slug: Optional[str], task_ids: list[str]) ->
             "estimated_cost_usd": 0.0,
             "actual_cost_usd": 0.0,
             "_session_ids": set(),
+            "_sessionless_seen": False,
         })
         agg["runs"] += 1
         sid = snapshot.get("session_id") or meta.get("worker_session_id")
@@ -247,12 +248,17 @@ def _usage_from_run_snapshots(board_slug: Optional[str], task_ids: list[str]) ->
             if session_key in agg["_session_ids"]:
                 continue
             agg["_session_ids"].add(session_key)
+        elif agg["_sessionless_seen"]:
+            continue
+        else:
+            agg["_sessionless_seen"] = True
         for key in ("input_tokens", "output_tokens", "reasoning_tokens"):
             agg[key] += int(snapshot.get(key) or 0)
         for key in ("estimated_cost_usd", "actual_cost_usd"):
             agg[key] += float(snapshot.get(key) or 0.0)
     for agg in out.values():
         agg["sessions"] = len(agg.pop("_session_ids"))
+        agg.pop("_sessionless_seen", None)
     return out
 
 

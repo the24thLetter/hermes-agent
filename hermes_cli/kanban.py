@@ -661,8 +661,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "usage", help="Show token/cost usage by board/task from the project usage ledger",
     )
     p_usage.add_argument("--task", dest="task_id", default=None, help="Drill down to a single task id")
-    p_usage.add_argument("--refresh", action="store_true", help="Refresh the derived ledger before reading")
-    p_usage.add_argument("--no-refresh", dest="no_refresh", action="store_true", help="Read existing ledger rows without backfill")
+    p_usage_refresh = p_usage.add_mutually_exclusive_group()
+    p_usage_refresh.add_argument("--refresh", dest="refresh", action="store_true", default=None, help="Refresh the derived ledger before reading")
+    p_usage_refresh.add_argument("--no-refresh", dest="refresh", action="store_false", help="Read existing ledger rows without backfill")
     p_usage.add_argument("--json", action="store_true")
 
     # --- notify subscribe / list / remove ---
@@ -2368,7 +2369,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_usage(args: argparse.Namespace) -> int:
     from hermes_cli import project_usage_ledger as usage
 
-    refresh = bool(getattr(args, "refresh", False)) or not bool(getattr(args, "no_refresh", False))
+    refresh = bool(getattr(args, "refresh", False))
     board = getattr(args, "board", None)
     if board:
         board = kb._normalize_board_slug(board)
