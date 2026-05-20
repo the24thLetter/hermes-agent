@@ -169,6 +169,31 @@ def _session_values(row: Optional[sqlite3.Row]) -> dict[str, Any]:
     }
 
 
+def _zero_usage_values(values: dict[str, Any]) -> dict[str, Any]:
+    """Return session identity/timing metadata with additive usage fields zeroed.
+
+    A single Hermes worker session can appear on multiple task_run rows when a
+    task retries or records multiple terminal runs. The source session totals are
+    cumulative for the whole session, so summing them once per run inflates board
+    and project totals. Keep the duplicate run visible for audit/drilldown while
+    counting the session's additive token/cost fields only once.
+    """
+    out = dict(values)
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "api_call_count",
+        "tool_call_count",
+    ):
+        out[key] = 0
+    out["estimated_cost_usd"] = 0.0
+    out["actual_cost_usd"] = 0.0
+    return out
+
+
 def _upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
     cols = [
         "source_type", "source_id", "board_slug", "board_name", "task_id",
@@ -201,6 +226,7 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
     session_entries = 0
     run_entries = 0
     linked_sessions: set[str] = set()
+    counted_session_usage: set[str] = set()
 
     if not state_path.exists():
         lconn.execute("INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)", (f"missing state db: {state_path}",))
@@ -253,6 +279,12 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
                         linked_sessions.add(str(session_id))
                     session_row = _get_state_session(sconn, session_id)
                     values = _session_values(session_row)
+                    if session_id:
+                        session_key = str(session_id)
+                        if session_key in counted_session_usage:
+                            values = _zero_usage_values(values)
+                        else:
+                            counted_session_usage.add(session_key)
                     _upsert_entry(lconn, {
                         **values,
                         "source_type": "task_run",
