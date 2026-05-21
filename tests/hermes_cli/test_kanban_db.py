@@ -2799,6 +2799,53 @@ def test_review_origin_stale_claim_restores_to_review(kanban_home):
     assert (reclaimed.payload or {}).get("restore_status") == "review"
 
 
+def test_review_origin_manual_reclaim_restores_to_review(kanban_home):
+    """Manual reclaim should preserve the lane that produced the active run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manual review reclaim", assignee="alice")
+        _set_task_status(conn, t, "review")
+        claimed = kb.claim_review_task(conn, t, ttl_seconds=60)
+        assert claimed is not None
+
+        assert kb.reclaim_task(conn, t, reason="operator retry")
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert task is not None
+    assert task.status == "review"
+    assert run is not None
+    assert run.status == "review"
+    assert run.outcome == "reclaimed"
+    reclaimed = [event for event in events if event.kind == "reclaimed"][-1]
+    assert (reclaimed.payload or {}).get("restore_status") == "review"
+
+
+def test_spawn_breaker_blocks_even_after_review_status_restore(kanban_home):
+    """Breaker UPDATE accepts review if spawn bookkeeping sees a restored task."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review breaker", assignee="alice")
+        _set_task_status(conn, t, "review")
+
+        tripped = kb._record_task_failure(
+            conn,
+            t,
+            "synthetic spawn failure",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=False,
+            restore_status="review",
+        )
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert tripped is True
+    assert task is not None
+    assert task.status == "blocked"
+    assert any(e.kind == "gave_up" for e in events)
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:
