@@ -2769,6 +2769,11 @@ def _run_started_from_review(conn: sqlite3.Connection, task_id: str, run_id: Opt
     return _event_payload_dict(row).get("source_status") == "review"
 
 
+def _status_after_failed_run(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> str:
+    """Return the queue status to restore after a failed worker attempt."""
+    return "review" if _run_started_from_review(conn, task_id, run_id) else "ready"
+
+
 def _latest_review_handoff(conn: sqlite3.Connection, task_id: str) -> dict:
     row = conn.execute(
         "SELECT payload FROM task_events "
@@ -4797,7 +4802,8 @@ def enforce_max_runtime(
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
-    ``timed_out`` event and drops the task back to ``ready`` so the next
+    ``timed_out`` event and drops the task back to ``ready`` (or back to
+    ``review`` when the failed attempt was a merge-captain review run) so the next
     dispatcher tick re-spawns it — unless the spawn-failure circuit
     breaker has already given up, in which case the task stays blocked
     where ``_record_spawn_failure`` parked it.
@@ -4812,7 +4818,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -4861,12 +4867,13 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
+            restore_status = _status_after_failed_run(conn, tid, row["current_run_id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running'",
-                (tid,),
+                (restore_status, tid),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -4948,6 +4955,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -4978,12 +4986,13 @@ def detect_stale_running(
         )
 
         with write_txn(conn):
+            restore_status = _status_after_failed_run(conn, tid, row["current_run_id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running'",
-                (tid,),
+                (restore_status, tid),
             )
             if cur.rowcount != 1:
                 continue
@@ -5058,8 +5067,9 @@ def _error_fingerprint(error_text: str) -> str:
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
-    Appends a ``crashed`` event and drops the task back to ``ready``.
-    Different from ``release_stale_claims``: this checks liveness
+    Appends a ``crashed`` event and drops the task back to ``ready`` (or
+    back to ``review`` when the failed attempt was a merge-captain review
+    run). Different from ``release_stale_claims``: this checks liveness
     immediately rather than waiting for the claim TTL.
 
     Only considers tasks claimed by *this host* — PIDs from other hosts
@@ -5084,7 +5094,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5136,11 +5146,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            restore_status = _status_after_failed_run(conn, row["id"], row["current_run_id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running'",
-                (row["id"],),
+                (restore_status, row["id"]),
             )
             if cur.rowcount == 1:
                 run_id = _end_run(
@@ -5289,7 +5300,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
