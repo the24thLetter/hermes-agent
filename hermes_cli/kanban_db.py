@@ -2840,6 +2840,7 @@ def _synthesize_ended_run(
     task_id: str,
     *,
     outcome: str,
+    status: Optional[str] = None,
     summary: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
@@ -2877,7 +2878,7 @@ def _synthesize_ended_run(
         """,
         (
             task_id, profile, step_key,
-            outcome, outcome,
+            status or outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now, now,
@@ -3823,6 +3824,7 @@ def complete_task(
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
+                status=target_status,
                 summary=summary if summary is not None else result,
                 metadata=effective_metadata,
             )
@@ -4383,6 +4385,7 @@ def block_task(
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="blocked",
+                status=target_status,
                 summary=reason,
                 metadata=effective_metadata,
             )
@@ -5034,6 +5037,7 @@ def schedule_task(
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="scheduled",
+                status="scheduled",
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
