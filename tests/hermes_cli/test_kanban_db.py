@@ -3617,6 +3617,44 @@ def test_required_review_gate_block_returns_to_original_worker(kanban_home, monk
     assert any(e.kind == "review_rejected" for e in events)
 
 
+def test_required_review_gate_block_without_implementation_assignee_is_explicit(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unassigned impl", assignee=None)
+        impl = kb.claim_task(conn, t)
+        assert impl is not None
+        assert kb.complete_task(conn, t, summary="PR ready", expected_run_id=impl.current_run_id)
+        review = kb.claim_review_task(conn, t)
+        assert review is not None
+        assert kb.block_task(
+            conn,
+            t,
+            reason="review rejected",
+            expected_run_id=review.current_run_id,
+        )
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+        event = kb.list_events(conn, t)[-1]
+
+    assert task is not None
+    assert run is not None
+    assert task.status == "blocked"
+    assert task.assignee == "merge-captain"
+    assert run.outcome == "blocked"
+    assert run.status == "blocked"
+    assert (run.metadata or {}).get("review_rejection") is True
+    assert (run.metadata or {}).get("missing_implementation_assignee") is True
+    assert "implementation assignee" in (run.metadata or {}).get(
+        "review_rejection_reason", ""
+    )
+    assert event.kind == "blocked"
+    assert (event.payload or {}).get("review_rejection") is True
+    assert (event.payload or {}).get("missing_implementation_assignee") is True
+
+
 def test_dispatch_review_does_not_claim_ready_tasks(
     kanban_home, all_assignees_spawnable,
 ):
