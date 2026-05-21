@@ -384,7 +384,11 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
         assert task.status == "scheduled"
+        assert run is not None
+        assert run.status == "scheduled"
+        assert run.outcome == "scheduled"
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
@@ -3292,6 +3296,24 @@ def test_required_review_gate_routes_implementation_completion_to_merge_captain(
     assert run.status == "review"
     assert run.outcome == "completed"
     assert any(e.kind == "submitted_for_review" for e in events)
+
+
+def test_ready_completion_synthesizes_review_status_run(kanban_home, monkeypatch):
+    """Synthetic completion runs should preserve the destination lane."""
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manual impl completion", assignee="worker-a")
+        assert kb.complete_task(conn, t, summary="PR ready without active claim")
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+
+    assert task is not None
+    assert run is not None
+    assert task.status == "review"
+    assert task.assignee == "merge-captain"
+    assert run.status == "review"
+    assert run.outcome == "completed"
 
 
 def test_required_review_gate_allows_review_run_to_complete_done(kanban_home, monkeypatch):
