@@ -678,6 +678,35 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
             f"expected default for {bad_val!r}, got {result}"
         )
 
+def test_detect_crashed_review_worker_returns_to_review(
+    kanban_home, monkeypatch,
+):
+    """A crashed merge-captain attempt must stay in Review, not ready."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review crash", assignee="mergecaptain")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer")
+        assert claimed is not None
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (81000, tid))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+            (81000, claimed.current_run_id),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "mergecaptain"
+        assert task.claim_lock is None
+
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
