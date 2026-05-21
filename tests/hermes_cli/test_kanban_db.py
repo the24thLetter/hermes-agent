@@ -1288,6 +1288,39 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_recent_success_older_than_unblock_not_guarded(kanban_home):
+    """Review/manual handoff after a successful run must allow re-spawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs-followup", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 120),
+        )
+        assert kb.block_task(conn, t, reason="review found follow-up")
+        assert kb.unblock_task(conn, t)
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_pr_comment_older_than_unblock_not_guarded(kanban_home):
+    """A PR URL from the previous handoff must not pin a requeued task."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix-pr-followup", assignee="alice")
+        old_ts = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/11', ?)",
+            (t, old_ts),
+        )
+        assert kb.block_task(conn, t, reason="review found follow-up")
+        assert kb.unblock_task(conn, t)
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
@@ -2713,6 +2746,49 @@ def test_dispatch_review_spawn_failure_blocks_intentionally_at_threshold(
     assert (run.metadata or {}).get("restore_status") == "review"
     gave_up = [event for event in events if event.kind == "gave_up"][-1]
     assert (gave_up.payload or {}).get("restore_status") == "review"
+
+
+def test_review_origin_crash_breaker_keeps_restore_status_metadata(
+    kanban_home, all_assignees_spawnable,
+):
+    """Breaker metadata keeps review origin even after _end_run clears current_run_id."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review crash", assignee="alice", max_retries=1)
+        _set_task_status(conn, t, "review")
+        assert kb.claim_review_task(conn, t) is not None
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (99999999, t))
+
+        crashed = kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert crashed == [t]
+    assert task is not None
+    assert task.status == "blocked"
+    gave_up = [event for event in events if event.kind == "gave_up"][-1]
+    assert (gave_up.payload or {}).get("restore_status") == "review"
+
+
+def test_review_origin_stale_claim_restores_to_review(kanban_home):
+    """Expired review claims should return to Review, not Ready."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review stale", assignee="alice")
+        _set_task_status(conn, t, "review")
+        claimed = kb.claim_review_task(conn, t, ttl_seconds=1)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, worker_pid = ? WHERE id = ?",
+            (int(time.time()) - 10, 99999999, t),
+        )
+
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert task is not None
+    assert task.status == "review"
+    reclaimed = [event for event in events if event.kind == "reclaimed"][-1]
+    assert (reclaimed.payload or {}).get("restore_status") == "review"
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

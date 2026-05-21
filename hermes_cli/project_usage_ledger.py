@@ -12,6 +12,7 @@ query-friendly view for dashboards and future reporting jobs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -104,6 +105,29 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
     else:
         conn.execute("UPDATE schema_version SET version = ?", (LEDGER_SCHEMA_VERSION,))
     return conn
+
+
+@contextlib.contextmanager
+def _ledger_write_txn(conn: sqlite3.Connection):
+    """Batch ledger writes in one explicit transaction.
+
+    Ledger connections are intentionally opened in autocommit mode so simple
+    dashboard operations stay straightforward. Backfill is different: it can
+    perform hundreds of `_upsert_entry` calls, and without an explicit
+    transaction each one commits independently. Reuse a caller's active
+    transaction if present; otherwise wrap the batch in BEGIN IMMEDIATE.
+    """
+    if conn.in_transaction:
+        yield conn
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
 
 
 def _json_loads(raw: Any) -> dict[str, Any]:
@@ -231,7 +255,8 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
     board_errors: list[str] = []
 
     if not state_path.exists():
-        lconn.execute("INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)", (f"missing state db: {state_path}",))
+        with _ledger_write_txn(lconn):
+            lconn.execute("INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)", (f"missing state db: {state_path}",))
         if owns_conn:
             lconn.close()
         return {"session_entries": 0, "run_entries": 0, "boards": 0, "ledger_path": str(ledger_path())}
@@ -240,130 +265,131 @@ def backfill(*, ledger_conn: Optional[sqlite3.Connection] = None) -> dict[str, A
     try:
         sconn = sqlite3.connect(str(state_path), timeout=30)
         sconn.row_factory = sqlite3.Row
-        # First materialize all board/task/run usage entries.  A run can link
-        # to a worker session via task_runs.metadata.worker_session_id or to an
-        # originating session via tasks.session_id.
-        boards = kanban_db.list_boards(include_archived=False)
-        for board in boards:
-            slug = board.get("slug") or kanban_db.DEFAULT_BOARD
-            try:
-                kanban_db.init_db(board=slug)
-                kconn = kanban_db.connect(board=slug)
-            except Exception as exc:
-                msg = f"{slug}: {exc}"
-                board_errors.append(msg)
-                log.warning("project usage backfill skipped board %s: %s", slug, exc)
-                continue
-            try:
-                rows = kconn.execute(
-                    """
-                    SELECT
-                        r.id AS run_id,
-                        r.task_id AS task_id,
-                        r.status AS run_status,
-                        r.outcome AS run_outcome,
-                        r.started_at AS run_started_at,
-                        r.ended_at AS run_ended_at,
-                        r.metadata AS run_metadata,
-                        t.title AS task_title,
-                        t.status AS task_status,
-                        t.session_id AS task_session_id
-                    FROM task_runs r
-                    LEFT JOIN tasks t ON t.id = r.task_id
-                    ORDER BY r.id
-                    """
-                ).fetchall()
-                for row in rows:
-                    meta = _json_loads(row["run_metadata"])
-                    session_id = (
-                        meta.get("worker_session_id")
-                        or meta.get("session_id")
-                        or row["task_session_id"]
-                    )
-                    if session_id:
-                        linked_sessions.add(str(session_id))
-                    session_row = _get_state_session(sconn, session_id)
-                    values = _session_values(session_row)
-                    if session_id:
-                        session_key = (str(row["task_id"]), str(session_id))
-                        if session_key in counted_task_session_usage:
-                            values = _zero_usage_values(values)
-                        else:
-                            counted_task_session_usage.add(session_key)
-                    _upsert_entry(lconn, {
-                        **values,
-                        "source_type": "task_run",
-                        "source_id": f"{slug}:{row['run_id']}",
-                        "board_slug": slug,
-                        "board_name": board.get("name") or slug,
-                        "task_id": row["task_id"],
-                        "task_title": row["task_title"],
-                        "task_status": row["task_status"],
-                        "run_id": row["run_id"],
-                        "run_status": row["run_status"],
-                        "run_outcome": row["run_outcome"],
-                        "started_at": values.get("started_at") or row["run_started_at"],
-                        "ended_at": values.get("ended_at") or row["run_ended_at"],
-                        "metadata": json.dumps(meta, sort_keys=True) if meta else None,
-                        "backfilled_at": now,
-                    })
-                    run_entries += 1
-            except Exception as exc:
-                msg = f"{slug}: {exc}"
-                board_errors.append(msg)
-                log.warning("project usage backfill skipped board %s: %s", slug, exc)
-            finally:
-                kconn.close()
+        with _ledger_write_txn(lconn):
+            # First materialize all board/task/run usage entries.  A run can link
+            # to a worker session via task_runs.metadata.worker_session_id or to an
+            # originating session via tasks.session_id.
+            boards = kanban_db.list_boards(include_archived=False)
+            for board in boards:
+                slug = board.get("slug") or kanban_db.DEFAULT_BOARD
+                try:
+                    kanban_db.init_db(board=slug)
+                    kconn = kanban_db.connect(board=slug)
+                except Exception as exc:
+                    msg = f"{slug}: {exc}"
+                    board_errors.append(msg)
+                    log.warning("project usage backfill skipped board %s: %s", slug, exc)
+                    continue
+                try:
+                    rows = kconn.execute(
+                        """
+                        SELECT
+                            r.id AS run_id,
+                            r.task_id AS task_id,
+                            r.status AS run_status,
+                            r.outcome AS run_outcome,
+                            r.started_at AS run_started_at,
+                            r.ended_at AS run_ended_at,
+                            r.metadata AS run_metadata,
+                            t.title AS task_title,
+                            t.status AS task_status,
+                            t.session_id AS task_session_id
+                        FROM task_runs r
+                        LEFT JOIN tasks t ON t.id = r.task_id
+                        ORDER BY r.id
+                        """
+                    ).fetchall()
+                    for row in rows:
+                        meta = _json_loads(row["run_metadata"])
+                        session_id = (
+                            meta.get("worker_session_id")
+                            or meta.get("session_id")
+                            or row["task_session_id"]
+                        )
+                        if session_id:
+                            linked_sessions.add(str(session_id))
+                        session_row = _get_state_session(sconn, session_id)
+                        values = _session_values(session_row)
+                        if session_id:
+                            session_key = (str(row["task_id"]), str(session_id))
+                            if session_key in counted_task_session_usage:
+                                values = _zero_usage_values(values)
+                            else:
+                                counted_task_session_usage.add(session_key)
+                        _upsert_entry(lconn, {
+                            **values,
+                            "source_type": "task_run",
+                            "source_id": f"{slug}:{row['run_id']}",
+                            "board_slug": slug,
+                            "board_name": board.get("name") or slug,
+                            "task_id": row["task_id"],
+                            "task_title": row["task_title"],
+                            "task_status": row["task_status"],
+                            "run_id": row["run_id"],
+                            "run_status": row["run_status"],
+                            "run_outcome": row["run_outcome"],
+                            "started_at": values.get("started_at") or row["run_started_at"],
+                            "ended_at": values.get("ended_at") or row["run_ended_at"],
+                            "metadata": json.dumps(meta, sort_keys=True) if meta else None,
+                            "backfilled_at": now,
+                        })
+                        run_entries += 1
+                except Exception as exc:
+                    msg = f"{slug}: {exc}"
+                    board_errors.append(msg)
+                    log.warning("project usage backfill skipped board %s: %s", slug, exc)
+                finally:
+                    kconn.close()
 
-        # Remove stale unassigned rows for sessions that are now attributable to
-        # board task_runs. Backfill is idempotent and sessions can become linked
-        # after an earlier pass materialized them as source_type='session'.
-        if linked_sessions:
-            placeholders = ", ".join(["?"] * len(linked_sessions))
+            # Remove stale unassigned rows for sessions that are now attributable to
+            # board task_runs. Backfill is idempotent and sessions can become linked
+            # after an earlier pass materialized them as source_type='session'.
+            if linked_sessions:
+                placeholders = ", ".join(["?"] * len(linked_sessions))
+                lconn.execute(
+                    f"DELETE FROM usage_entries WHERE source_type = 'session' AND source_id IN ({placeholders})",
+                    tuple(linked_sessions),
+                )
+
+            # Also materialize raw sessions that were not attributable to a board.
+            for row in sconn.execute("SELECT * FROM sessions ORDER BY started_at"):
+                if row["id"] in linked_sessions:
+                    continue
+                values = _session_values(row)
+                _upsert_entry(lconn, {
+                    **values,
+                    "source_type": "session",
+                    "source_id": row["id"],
+                    "board_slug": None,
+                    "board_name": None,
+                    "task_id": None,
+                    "task_title": None,
+                    "task_status": None,
+                    "run_id": None,
+                    "run_status": None,
+                    "run_outcome": None,
+                    "metadata": None,
+                    "backfilled_at": now,
+                })
+                session_entries += 1
+
             lconn.execute(
-                f"DELETE FROM usage_entries WHERE source_type = 'session' AND source_id IN ({placeholders})",
-                tuple(linked_sessions),
+                "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_at', ?)",
+                (str(now),),
             )
-
-        # Also materialize raw sessions that were not attributable to a board.
-        for row in sconn.execute("SELECT * FROM sessions ORDER BY started_at"):
-            if row["id"] in linked_sessions:
-                continue
-            values = _session_values(row)
-            _upsert_entry(lconn, {
-                **values,
-                "source_type": "session",
-                "source_id": row["id"],
-                "board_slug": None,
-                "board_name": None,
-                "task_id": None,
-                "task_title": None,
-                "task_status": None,
-                "run_id": None,
-                "run_status": None,
-                "run_outcome": None,
-                "metadata": None,
-                "backfilled_at": now,
-            })
-            session_entries += 1
-
-        lconn.execute(
-            "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_at', ?)",
-            (str(now),),
-        )
-        if board_errors:
-            lconn.execute(
-                "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)",
-                ("; ".join(board_errors),),
-            )
-        else:
-            lconn.execute("DELETE FROM ledger_meta WHERE key = 'last_backfill_error'")
-        return {
-            "session_entries": session_entries,
-            "run_entries": run_entries,
-            "boards": len(boards),
-            "ledger_path": str(ledger_path()),
-        }
+            if board_errors:
+                lconn.execute(
+                    "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES ('last_backfill_error', ?)",
+                    ("; ".join(board_errors),),
+                )
+            else:
+                lconn.execute("DELETE FROM ledger_meta WHERE key = 'last_backfill_error'")
+            return {
+                "session_entries": session_entries,
+                "run_entries": run_entries,
+                "boards": len(boards),
+                "ledger_path": str(ledger_path()),
+            }
     finally:
         if sconn is not None:
             sconn.close()
