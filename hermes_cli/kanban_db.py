@@ -5107,10 +5107,6 @@ _RESPAWN_REQUEUE_EVENT_KINDS = (
     "unblocked",
     "review_rejected",
     "promoted",
-    "reclaimed",
-    "crashed",
-    "timed_out",
-    "spawn_failed",
 )
 
 
