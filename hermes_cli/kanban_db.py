@@ -3310,7 +3310,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "       current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -3374,12 +3375,13 @@ def release_stale_claims(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
         with write_txn(conn):
+            restore_status = _status_after_failed_run(conn, row["id"], row["current_run_id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (restore_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -3403,6 +3405,7 @@ def release_stale_claims(
                 "now": now,
                 "host_local": host_local,
                 "heartbeat_stale": bool(heartbeat_stale),
+                "restore_status": restore_status,
             }
             payload.update(termination)
             _append_event(
@@ -5090,6 +5093,20 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Events that explicitly put a task back into the spawnable ready queue after
+# earlier work. Respawn guards must not treat PR/success evidence from before
+# one of these handoffs as a reason to skip the newly requested implementation
+# pass.
+_RESPAWN_REQUEUE_EVENT_KINDS = (
+    "unblocked",
+    "review_rejected",
+    "promoted",
+    "reclaimed",
+    "crashed",
+    "timed_out",
+    "spawn_failed",
+)
+
 
 @dataclass
 class DispatchResult:
@@ -5529,6 +5546,7 @@ def enforce_max_runtime(
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
+                restore_status=restore_status,
             )
     return timed_out
 
@@ -5708,8 +5726,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, str]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, restore_status)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
@@ -5823,7 +5841,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, restore_status)
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -5839,10 +5857,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _restore_status in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, restore_status in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
@@ -5856,6 +5874,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
+                restore_status=restore_status,
             )
             if tripped:
                 auto_blocked.append(tid)
@@ -5876,10 +5895,11 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    restore_status: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -5930,7 +5950,8 @@ def _record_task_failure(
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
         current_run_id = row["current_run_id"] if "current_run_id" in row.keys() else None
-        restore_status = _status_after_failed_run(conn, task_id, current_run_id)
+        if restore_status is None:
+            restore_status = _status_after_failed_run(conn, task_id, current_run_id)
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -6038,7 +6059,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -6092,12 +6113,28 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+def _latest_respawn_request_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Latest event timestamp that deliberately returned a task to ready.
 
-    Called per ready task in ``dispatch_once`` before any claim attempt.
-    Returning a reason defers the spawn this tick; the task stays in
-    ``ready`` and gets another chance on the next dispatcher tick.
+    Respawn guards exist to avoid duplicating work after a recent successful
+    run or PR-opening handoff. They should not suppress a later review
+    rejection or manual unblock that explicitly asks the implementation lane
+    to run again on the same task.
+    """
+    placeholders = ", ".join("?" for _ in _RESPAWN_REQUEUE_EVENT_KINDS)
+    row = conn.execute(
+        f"SELECT MAX(created_at) AS ts FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders})",
+        (task_id, *_RESPAWN_REQUEUE_EVENT_KINDS),
+    ).fetchone()
+    if row is None:
+        return None
+    ts = row["ts"]
+    return int(ts) if ts is not None else None
+
+
+def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return a guard reason that should temporarily suppress auto-spawn.
 
     Checks in priority order:
 
@@ -6125,13 +6162,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
-        seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning.
+        seconds and no later event explicitly returned the task to the
+        ready queue. Useful work already succeeded for this task; wait
+        for human review rather than immediately re-spawning.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a recent task comment and no later
+        ready-queue handoff superseded it. A prior worker already opened
+        a PR; re-spawning risks a duplicate PR on the same task.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -6188,20 +6226,30 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # 3. Completed run within guard window — proof of recent success.
+    respawn_requested_at = _latest_respawn_request_at(conn, task_id)
+
+    # 3. Completed run within guard window — proof of recent success, unless
+    # review/manual handoff returned the same task to implementation later.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+    success_cutoff = cutoff
+    if respawn_requested_at is not None:
+        success_cutoff = max(success_cutoff, respawn_requested_at + 1)
     if conn.execute(
         "SELECT id FROM task_runs "
         "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
-        (task_id, cutoff),
+        (task_id, success_cutoff),
     ).fetchone():
         return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR,
+    # unless a later review/manual handoff made the PR comment stale context.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    comment_cutoff = pr_cutoff
+    if respawn_requested_at is not None:
+        comment_cutoff = max(comment_cutoff, respawn_requested_at + 1)
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
+        (task_id, comment_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"

@@ -75,6 +75,25 @@ def test_project_usage_backfill_correlates_kanban_run_to_session(usage_home):
     assert data["runs"][0]["session_id"] == "sess-usage-1"
 
 
+def test_project_usage_backfill_batches_upserts_in_transaction(usage_home, monkeypatch):
+    _seed_session(usage_home, "sess-txn", in_tok=100, out_tok=50, cost=0.0123)
+    _seed_completed_run("sess-txn")
+    real_upsert = usage._upsert_entry
+    saw_upsert = False
+
+    def assert_transaction(conn, entry):
+        nonlocal saw_upsert
+        saw_upsert = True
+        assert conn.in_transaction is True
+        return real_upsert(conn, entry)
+
+    monkeypatch.setattr(usage, "_upsert_entry", assert_transaction)
+
+    usage.backfill()
+
+    assert saw_upsert is True
+
+
 def test_project_usage_backfill_counts_session_usage_once_across_runs(usage_home):
     _seed_session(usage_home, "sess-retry", in_tok=100, out_tok=50, cost=0.0123)
     tid = _seed_completed_run("sess-retry")
