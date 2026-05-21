@@ -2846,6 +2846,31 @@ def test_spawn_breaker_blocks_even_after_review_status_restore(kanban_home):
     assert any(e.kind == "gave_up" for e in events)
 
 
+def test_spawn_failure_below_threshold_updates_review_restored_task(kanban_home):
+    """Below-threshold spawn bookkeeping also accepts review-restored tasks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review below threshold", assignee="alice")
+        _set_task_status(conn, t, "review")
+
+        tripped = kb._record_task_failure(
+            conn,
+            t,
+            "synthetic spawn failure",
+            outcome="spawn_failed",
+            failure_limit=2,
+            release_claim=True,
+            end_run=False,
+            restore_status="review",
+        )
+        task = kb.get_task(conn, t)
+
+    assert tripped is False
+    assert task is not None
+    assert task.status == "review"
+    assert task.consecutive_failures == 1
+    assert task.last_failure_error == "synthetic spawn failure"
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:

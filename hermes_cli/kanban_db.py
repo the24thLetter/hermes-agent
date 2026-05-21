@@ -4698,7 +4698,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (restore_status, failures, error[:500], task_id),
                 )
             else:
