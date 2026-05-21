@@ -3737,13 +3737,21 @@ def block_task(
         handoff = _latest_review_handoff(conn, task_id) if review_rejection else {}
         implementation_assignee = handoff.get("implementation_assignee")
         effective_metadata = metadata
-        if review_rejection and implementation_assignee:
+        if review_rejection:
             if effective_metadata is None:
                 effective_metadata = {}
             else:
                 effective_metadata = dict(effective_metadata)
-            effective_metadata.setdefault("implementation_assignee", implementation_assignee)
             effective_metadata.setdefault("review_rejection", True)
+            if implementation_assignee:
+                effective_metadata.setdefault("implementation_assignee", implementation_assignee)
+            else:
+                effective_metadata.setdefault("missing_implementation_assignee", True)
+                effective_metadata.setdefault(
+                    "review_rejection_reason",
+                    "Review-origin block could not be returned to an implementation assignee because the latest Review handoff did not record one.",
+                )
+        if review_rejection and implementation_assignee:
             if expected_run_id is None:
                 cur = conn.execute(
                     """
@@ -3823,8 +3831,15 @@ def block_task(
                 metadata=effective_metadata,
             )
         payload = {"reason": reason}
-        if event_kind == "review_rejected":
-            payload["implementation_assignee"] = implementation_assignee
+        if review_rejection:
+            payload["review_rejection"] = True
+            if implementation_assignee:
+                payload["implementation_assignee"] = implementation_assignee
+            else:
+                payload["missing_implementation_assignee"] = True
+                payload["review_rejection_reason"] = effective_metadata.get(
+                    "review_rejection_reason"
+                ) if effective_metadata else None
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         return True
 
