@@ -4266,6 +4266,33 @@ def edit_completed_task_result(
     return True
 
 
+_REVIEW_REBASE_BLOCKER_MARKERS = (
+    "rebase-required",
+    "branch-staleness",
+    "merge-conflict",
+    "merge conflict",
+    "conflict-resolution",
+    "conflict resolution",
+    "mergeable_state=dirty",
+    "mergeable state dirty",
+    "not current with latest origin/main",
+    "origin/main advanced",
+    "branch needs a rebase",
+)
+
+
+def _review_block_is_rebase_or_conflict(reason: Optional[str]) -> bool:
+    """Return True for Review-origin blockers that belong in Blocked.
+
+    Normal Review cycles (Bugbot findings, requested tests, PR-body/check
+    cleanup) should go back to the implementation assignee in Ready.  Blocked
+    is reserved for branch-staleness / rebase / merge-conflict work that the
+    self-recovery lane can repair and then hand back to Review.
+    """
+    text = (reason or "").casefold()
+    return any(marker in text for marker in _REVIEW_REBASE_BLOCKER_MARKERS)
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4276,10 +4303,11 @@ def block_task(
 ) -> bool:
     """Transition ``running -> blocked``.
 
-    When the required Review gate is enabled and the active run started from
-    the Review column, ``kanban_block`` means "Bugbot/review rejected this PR".
-    In that case the task is automatically returned to the original
+    When the active run started from the Review column, ``kanban_block`` is
+    usually a review-cycle rejection and the task is returned to the original
     implementation assignee in ``ready`` instead of getting stuck in Blocked.
+    The exception is a branch-staleness / rebase / merge-conflict blocker;
+    those remain sticky-blocked for the narrow self-recovery handoff lane.
     """
     with write_txn(conn):
         task_row = conn.execute(
@@ -4289,26 +4317,33 @@ def block_task(
         if not task_row:
             return False
         run_for_gate = expected_run_id if expected_run_id is not None else task_row["current_run_id"]
-        review_rejection = review_gate_enabled() and _run_started_from_review(
+        review_origin = _run_started_from_review(
             conn, task_id, int(run_for_gate) if run_for_gate else None
         )
-        handoff = _latest_review_handoff(conn, task_id) if review_rejection else {}
+        review_rebase_blocker = review_origin and _review_block_is_rebase_or_conflict(reason)
+        review_rejection = review_origin and not review_rebase_blocker
+        handoff = _latest_review_handoff(conn, task_id) if review_origin else {}
         implementation_assignee = handoff.get("implementation_assignee")
         effective_metadata = metadata
-        if review_rejection:
+        if review_origin:
             if effective_metadata is None:
                 effective_metadata = {}
             else:
                 effective_metadata = dict(effective_metadata)
-            effective_metadata.setdefault("review_rejection", True)
-            if implementation_assignee:
-                effective_metadata.setdefault("implementation_assignee", implementation_assignee)
+            if review_rebase_blocker:
+                effective_metadata.setdefault("review_rebase_blocker", True)
+                if implementation_assignee:
+                    effective_metadata.setdefault("implementation_assignee", implementation_assignee)
             else:
-                effective_metadata.setdefault("missing_implementation_assignee", True)
-                effective_metadata.setdefault(
-                    "review_rejection_reason",
-                    "Review-origin block could not be returned to an implementation assignee because the latest Review handoff did not record one.",
-                )
+                effective_metadata.setdefault("review_rejection", True)
+                if implementation_assignee:
+                    effective_metadata.setdefault("implementation_assignee", implementation_assignee)
+                else:
+                    effective_metadata.setdefault("missing_implementation_assignee", True)
+                    effective_metadata.setdefault(
+                        "review_rejection_reason",
+                        "Review-origin block could not be returned to an implementation assignee because the latest Review handoff did not record one.",
+                    )
         if review_rejection and implementation_assignee:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -4389,7 +4424,11 @@ def block_task(
                 summary=reason,
                 metadata=effective_metadata,
             )
-        payload = {"reason": reason}
+        payload: dict[str, Any] = {"reason": reason}
+        if review_rebase_blocker:
+            payload["review_rebase_blocker"] = True
+            if implementation_assignee:
+                payload["implementation_assignee"] = implementation_assignee
         if review_rejection:
             payload["review_rejection"] = True
             if implementation_assignee:
@@ -7048,6 +7087,17 @@ def _default_spawn(
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
+    # Review-gate policy is board/root-level process state, not profile-local
+    # persona state.  Workers switch HERMES_HOME to their assignee profile
+    # below, so copy the dispatcher's effective review config into env first;
+    # otherwise a merge-captain profile missing the kanban stanza can treat
+    # Review-column blocks as sticky Blocked and skip the Review protocol text.
+    env.setdefault(
+        "HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE",
+        "1" if review_gate_enabled() else "0",
+    )
+    env.setdefault("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", merge_captain_profile())
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's
@@ -7322,8 +7372,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
-    if review_gate_enabled():
-        review_run = _run_started_from_review(conn, task_id, task.current_run_id)
+    review_run = _run_started_from_review(conn, task_id, task.current_run_id)
+    if review_gate_enabled() or review_run:
         if review_run:
             handoff = _latest_review_handoff(conn, task_id)
             implementation_assignee = handoff.get("implementation_assignee") or "(unknown)"
@@ -7335,9 +7385,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
             lines.append(
                 f"Original implementation assignee: {implementation_assignee}. If Bugbot "
-                "finds issues or the branch needs a rebase because another PR merged, call "
-                "kanban_block with the exact required fixes/rebase instructions; Hermes will "
-                "automatically return the card to that assignee in Ready."
+                "finds issues or normal review changes are needed, call kanban_block with "
+                "the exact required fixes; Hermes will automatically return the card to "
+                "that assignee in Ready. Only use a rebase/merge-conflict/blocker reason "
+                "when the branch is stale or conflicted; those cases may enter Blocked for "
+                "narrow self-recovery and then return to Review."
             )
             lines.append(
                 "Only call kanban_complete after the PR is clean, up to date, merged, and the "
