@@ -2194,6 +2194,12 @@ class TestSharedBoardPaths:
         # `-p <profile>` flag rewrites HERMES_HOME.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            "kanban:\n"
+            "  require_review_before_done: true\n"
+            "  merge_captain_profile: merge-captain\n",
+            encoding="utf-8",
+        )
         self._set_home(monkeypatch, tmp_path, default_home)
 
         captured = {}
@@ -2233,6 +2239,8 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE"] == "1"
+        assert env["HERMES_KANBAN_MERGE_CAPTAIN_PROFILE"] == "merge-captain"
 
 
 # ---------------------------------------------------------------------------
@@ -3407,7 +3415,7 @@ def test_required_review_gate_block_returns_to_original_worker(kanban_home, monk
         assert kb.block_task(
             conn,
             t,
-            reason="Bugbot found issue; rebase after recent merge and fix failing test.",
+            reason="Bugbot found issue; fix failing test and update the PR body.",
             expected_run_id=review.current_run_id,
         )
         task = kb.get_task(conn, t)
@@ -3421,6 +3429,70 @@ def test_required_review_gate_block_returns_to_original_worker(kanban_home, monk
     assert run.outcome == "blocked"
     assert run.status == "ready"
     assert any(e.kind == "review_rejected" for e in events)
+
+
+def test_required_review_gate_rebase_block_stays_blocked_for_recovery(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale PR", assignee="worker-a")
+        impl = kb.claim_task(conn, t)
+        assert impl is not None
+        assert kb.complete_task(conn, t, summary="PR ready", expected_run_id=impl.current_run_id)
+        review = kb.claim_review_task(conn, t)
+        assert review is not None
+        assert kb.block_task(
+            conn,
+            t,
+            reason=(
+                "rebase-required: PR is exact-head clean, but origin/main "
+                "advanced and GitHub reports mergeable_state=dirty."
+            ),
+            expected_run_id=review.current_run_id,
+        )
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+        run = kb.latest_run(conn, t)
+
+    assert task is not None
+    assert run is not None
+    assert task.status == "blocked"
+    assert task.assignee == "merge-captain"
+    assert run.outcome == "blocked"
+    assert run.status == "blocked"
+    assert (run.metadata or {}).get("review_rebase_blocker") is True
+    assert events[-1].kind == "blocked"
+    assert (events[-1].payload or {}).get("review_rebase_blocker") is True
+
+
+def test_review_origin_block_routes_even_when_profile_config_lacks_gate(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="profile gap", assignee="worker-a")
+        impl = kb.claim_task(conn, t)
+        assert impl is not None
+        assert kb.complete_task(conn, t, summary="PR ready", expected_run_id=impl.current_run_id)
+        review = kb.claim_review_task(conn, t)
+        assert review is not None
+        monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "0")
+        assert kb.block_task(
+            conn,
+            t,
+            reason="Bugbot found an issue; fix it and resubmit.",
+            expected_run_id=review.current_run_id,
+        )
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "worker-a"
+    assert events[-1].kind == "review_rejected"
 
 
 def test_required_review_gate_block_without_implementation_assignee_is_explicit(
