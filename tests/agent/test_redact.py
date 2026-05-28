@@ -427,6 +427,23 @@ class TestWebUrlsNotRedacted:
         )
         assert redact_sensitive_text(text) == text
 
+    def test_force_redacts_sensitive_web_url_query_params(self):
+        text = "error url=https://api.example.com/v1?token=querysecret12345&format=json"
+        result = redact_sensitive_text(text, force=True)
+        assert "querysecret12345" not in result
+        assert "token=***" in result
+        assert "format=json" in result
+
+    def test_force_redacts_sensitive_http_access_log_request_target_query_params(self):
+        text = (
+            'INFO aiohttp.access: 127.0.0.1 "POST '
+            '/bluebubbles-webhook?password=webhookSecret123&event=new-message '
+            'HTTP/1.1" 200 173 "-" "test-client"'
+        )
+        result = redact_sensitive_text(text, force=True)
+        assert "webhookSecret123" not in result
+        assert "/bluebubbles-webhook?password=***&event=new-message" in result
+
     def test_known_prefix_inside_url_still_redacted(self):
         """sk-/ghp_/JWT-shaped values inside a URL are still caught by
         _PREFIX_RE / _JWT_RE — the carve-out is for opaque tokens only."""
