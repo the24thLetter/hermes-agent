@@ -3652,7 +3652,7 @@ def test_review_pressure_counts_active_prs_and_board_stats_surface_queue_pressur
         kb.add_comment(conn, active_pr, "bot", "PR https://github.com/acme/app/pull/10")
         kb.add_comment(conn, blocked_pr, "bot", "PR https://github.com/acme/app/pull/11")
         kb.add_comment(conn, done_pr, "bot", "PR https://github.com/acme/app/pull/12")
-        kb.complete_task(conn, done_pr)
+        _set_task_status(conn, done_pr, "done")
         pressure = kb.review_pressure_counts(conn)
         stats = kb.board_stats(conn)
 
