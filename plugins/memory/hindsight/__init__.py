@@ -1283,7 +1283,9 @@ class HindsightMemoryProvider(MemoryProvider):
             # Allow comma-separated strings for parity with recall_tags.
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
-            self._recall_types = list(configured_types) or ["observation"]
+            # An explicit empty list means "no type filter" for backwards
+            # compatibility; only an absent key gets the observation-only default.
+            self._recall_types = list(configured_types)
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)

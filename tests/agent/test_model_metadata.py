@@ -23,7 +23,6 @@ from agent.model_metadata import (
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
     get_model_context_length,
-    get_next_probe_tier,
     get_cached_context_length,
     parse_context_limit_from_error,
     save_context_length,
@@ -1306,35 +1305,6 @@ class TestContextProbeTiers:
         for i in range(len(CONTEXT_PROBE_TIERS) - 1):
             assert CONTEXT_PROBE_TIERS[i] > CONTEXT_PROBE_TIERS[i + 1]
 
-
-class TestGetNextProbeTier:
-    def test_from_256k(self):
-        assert get_next_probe_tier(256_000) == 128_000
-
-    def test_from_128k(self):
-        assert get_next_probe_tier(128_000) == 64_000
-
-    def test_from_64k(self):
-        assert get_next_probe_tier(64_000) == 32_000
-
-    def test_from_32k(self):
-        assert get_next_probe_tier(32_000) == 16_000
-
-    def test_from_8k_returns_none(self):
-        assert get_next_probe_tier(8_000) is None
-
-    def test_from_below_min_returns_none(self):
-        assert get_next_probe_tier(4_000) is None
-
-    def test_from_arbitrary_value(self):
-        assert get_next_probe_tier(100_000) == 64_000
-
-    def test_above_max_tier(self):
-        """Value above 256K should return 256K."""
-        assert get_next_probe_tier(500_000) == 256_000
-
-    def test_zero_returns_none(self):
-        assert get_next_probe_tier(0) is None
 
 
 # =========================================================================
