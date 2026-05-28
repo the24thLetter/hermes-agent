@@ -1,7 +1,9 @@
 from pathlib import Path
 
+from scripts.docker_imagetools_revision import extract_revision
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "docker-publish.yml"
+REVISION = "org.opencontainers.image.revision"
 
 
 def _manifest_script() -> str:
@@ -19,7 +21,7 @@ def test_main_push_publishes_main_tag_without_moving_latest() -> None:
     assert "${IMAGE_NAME}:latest" not in non_release_branch
 
 
-def test_release_latest_update_is_guarded_by_current_registry_latest_revision() -> None:
+def test_release_always_publishes_release_tag_and_can_advance_latest() -> None:
     script = _manifest_script()
     release_branch = script.split('if [ "${{ github.event_name }}" = "release" ]; then\n', 1)[1].split(
         "\n          else\n",
@@ -29,7 +31,58 @@ def test_release_latest_update_is_guarded_by_current_registry_latest_revision() 
     assert '-t "${IMAGE_NAME}:${TAG}"' in release_branch
     assert '-t "${IMAGE_NAME}:latest"' in release_branch
     assert 'docker buildx imagetools inspect "${IMAGE_NAME}:latest"' in release_branch
-    assert 'data.get("Image") or data.get("image")' in release_branch
-    assert 'image.get("Labels") or image.get("labels")' in release_branch
-    assert "org.opencontainers.image.revision" in release_branch
+    assert 'python3 "$GITHUB_WORKSPACE/scripts/docker_imagetools_revision.py"' in release_branch
+
+
+def test_release_latest_update_is_guarded_by_current_registry_latest_revision() -> None:
+    script = _manifest_script()
+    release_branch = script.split('if [ "${{ github.event_name }}" = "release" ]; then\n', 1)[1].split(
+        "\n          else\n",
+        1,
+    )[0]
+
+    assert 'latest_found=false' in release_branch
+    assert 'latest_found=true' in release_branch
     assert 'merge-base --is-ancestor "$latest_revision" "$tag_commit"' in release_branch
+    assert 'elif [ "$latest_found" = "false" ]; then' in release_branch
+    assert 'merge-base --is-ancestor origin/main "$tag_commit"' not in release_branch
+
+
+def test_revision_label_extraction_handles_actual_buildx_image_config_labels() -> None:
+    metadata = {
+        "image": {
+            "config": {
+                "Labels": {
+                    REVISION: "abc123",
+                },
+            },
+        },
+    }
+
+    assert extract_revision(metadata) == "abc123"
+
+
+def test_revision_label_extraction_handles_legacy_image_labels_shape() -> None:
+    metadata = {
+        "Image": {
+            "Labels": {
+                REVISION: "def456",
+            },
+        },
+    }
+
+    assert extract_revision(metadata) == "def456"
+
+
+def test_revision_label_extraction_returns_empty_for_missing_revision_label() -> None:
+    metadata = {
+        "image": {
+            "config": {
+                "Labels": {
+                    "org.opencontainers.image.created": "2026-05-28T00:00:00Z",
+                },
+            },
+        },
+    }
+
+    assert extract_revision(metadata) == ""

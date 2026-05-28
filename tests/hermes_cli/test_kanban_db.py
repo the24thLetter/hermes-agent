@@ -4383,6 +4383,23 @@ def test_required_review_gate_allows_review_run_to_complete_done(kanban_home, mo
     assert any(e.kind == "completed" for e in events)
 
 
+def test_required_review_context_rejects_cursor_unresolved_as_clean(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merge approved", assignee="worker-a")
+        impl = kb.claim_task(conn, t)
+        assert impl is not None
+        assert kb.complete_task(conn, t, summary="PR ready", expected_run_id=impl.current_run_id)
+        review = kb.claim_review_task(conn, t)
+        assert review is not None
+        context = kb.build_worker_context(conn, t)
+
+    assert "previously reported issue(s) remain unresolved" in context
+    assert "issueCount=0" in context
+    assert "is not clean" in context
+
+
 def test_required_review_gate_block_returns_to_original_worker(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE", "1")
     monkeypatch.setenv("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", "merge-captain")
