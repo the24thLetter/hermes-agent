@@ -3407,7 +3407,7 @@ def _lane_config(**overrides):
 def test_dispatch_reserved_review_slots_claim_review_first(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3430,7 +3430,7 @@ def test_dispatch_reserved_review_slots_claim_review_first(
 def test_dispatch_implementation_capped_to_non_review_lane_when_review_backlog_exists(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3452,7 +3452,7 @@ def test_dispatch_implementation_capped_to_non_review_lane_when_review_backlog_e
 def test_dispatch_backpressure_pauses_new_implementation_when_review_backlog_above_threshold(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3473,7 +3473,7 @@ def test_dispatch_backpressure_pauses_new_implementation_when_review_backlog_abo
 def test_dispatch_implementation_resumes_after_review_backlog_drains(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3516,7 +3516,7 @@ def _make_repo_with_origin(tmp_path: Path) -> tuple[Path, Path]:
 def test_dispatch_worktree_implementation_branch_starts_from_latest_base(
     kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     repo, _origin = _make_repo_with_origin(tmp_path)
     (repo / "file.txt").write_text("base 2\n")
     _git(repo, "commit", "-am", "base 2")
@@ -3554,7 +3554,7 @@ def test_dispatch_worktree_implementation_branch_starts_from_latest_base(
 def test_dispatch_blocks_stale_worktree_branch_with_rebase_guidance(
     kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
 ):
-    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    monkeypatch.setattr(kb, "_kanban_config", lambda board=None: _lane_config())
     repo, _origin = _make_repo_with_origin(tmp_path)
     old_base = _git(repo, "rev-parse", "origin/main")
     _git(repo, "branch", "feature/stale", old_base)
