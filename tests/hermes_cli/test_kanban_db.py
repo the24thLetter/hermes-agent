@@ -3697,6 +3697,191 @@ def test_dispatch_honors_per_board_lane_overrides(
     assert spawned == [*review[:2], *ready[:2]]
 
 
+def _set_board_kanban_config(board: str, **overrides) -> None:
+    meta = kb.read_board_metadata(board)
+    meta["kanban"] = {**(meta.get("kanban") or {}), **overrides}
+    meta.pop("db_path", None)
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_dispatch_worktree_fresh_base_uses_per_board_base_branch_override(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    board = "fresh-base-override"
+    repo, _origin = _make_repo_with_origin(tmp_path)
+    _git(repo, "checkout", "-b", "release/train")
+    (repo / "file.txt").write_text("release base\n")
+    _git(repo, "commit", "-am", "release base")
+    _git(repo, "push", "origin", "release/train")
+    release_sha = _git(repo, "rev-parse", "origin/release/train")
+    main_sha = _git(repo, "rev-parse", "origin/main")
+    assert release_sha != main_sha
+
+    kb.create_board(board, default_workdir=str(repo))
+    _set_board_kanban_config(board, implementation_base_branch="release/train")
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="impl",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "wt"),
+            branch_name="feature/board-base",
+            board=board,
+        )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8, board=board)
+
+    assert spawned == [tid]
+    assert _git(repo, "rev-parse", "feature/board-base") == release_sha
+
+
+def test_dispatch_review_uses_per_board_review_skills_override(
+    kanban_home, all_assignees_spawnable,
+):
+    board = "review-skill-overrides"
+    kb.create_board(board)
+    _set_board_kanban_config(
+        board,
+        review_agent_skills=["github/cursor-bugbot-sweep", "custom/review-log"],
+    )
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="review me", assignee="mergecaptain", board=board)
+        _set_task_status(conn, tid, "review")
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn, board=board)
+
+    assert len(res.spawned) == 1
+    assert spawned_tasks[0].skills == ["github/cursor-bugbot-sweep", "custom/review-log"]
+
+
+def test_default_spawn_env_uses_per_board_review_and_base_overrides(
+    kanban_home, monkeypatch, tmp_path,
+):
+    board = "spawn-env-overrides"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb.create_board(board)
+    _set_board_kanban_config(
+        board,
+        require_review_before_done=True,
+        merge_captain_profile="board-captain",
+        implementation_base_branch="release/train",
+    )
+    for key in (
+        "HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE",
+        "HERMES_KANBAN_MERGE_CAPTAIN_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    captured: dict[str, dict[str, str] | list[str] | str | None] = {}
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            captured["cwd"] = kwargs.get("cwd")
+
+    monkeypatch.setattr(kb.subprocess, "Popen", FakePopen)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="impl",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            branch_name="feature/spawn-env",
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert kb._default_spawn(task, str(workspace), board=board) == 4242
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE"] == "1"
+    assert env["HERMES_KANBAN_MERGE_CAPTAIN_PROFILE"] == "board-captain"
+    assert env["HERMES_KANBAN_BASE_BRANCH"] == "release/train"
+    assert env["HERMES_KANBAN_BOARD"] == board
+
+
+def test_worker_context_uses_per_board_review_gate_and_base_overrides(
+    kanban_home, monkeypatch, tmp_path,
+):
+    board = "worker-context-overrides"
+    kb.create_board(board)
+    _set_board_kanban_config(
+        board,
+        require_review_before_done=True,
+        merge_captain_profile="board-captain",
+        implementation_base_branch="release/train",
+    )
+    for key in (
+        "HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE",
+        "HERMES_KANBAN_MERGE_CAPTAIN_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="impl",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "wt"),
+            branch_name="feature/context",
+            board=board,
+        )
+        context = kb.build_worker_context(conn, tid)
+
+    assert "Mandatory Review-column gate" in context
+    assert "merge captain (board-captain)" in context
+    assert "origin/release/train" in context
+
+
+def test_complete_task_uses_per_board_review_gate_and_merge_captain(kanban_home, monkeypatch):
+    board = "complete-review-overrides"
+    kb.create_board(board)
+    _set_board_kanban_config(
+        board,
+        require_review_before_done=True,
+        merge_captain_profile="board-captain",
+    )
+    for key in (
+        "HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE",
+        "HERMES_KANBAN_MERGE_CAPTAIN_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="impl", assignee="alice", board=board)
+        assert kb.complete_task(conn, tid, summary="ready for review", metadata={"pr_url": "https://example.test/pr/1"})
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+
+    assert task is not None
+    assert task.status == "review"
+    assert task.assignee == "board-captain"
+    assert run is not None
+    assert run.status == "review"
+    assert (run.metadata or {}).get("implementation_assignee") == "alice"
+    assert (run.metadata or {}).get("review_assignee") == "board-captain"
+    assert (run.metadata or {}).get("review_gate") == "required"
+
+
 def test_merge_mutex_excludes_same_repo_base_until_released_or_expired(kanban_home):
     with kb.connect() as conn:
         first = kb.acquire_merge_mutex(
