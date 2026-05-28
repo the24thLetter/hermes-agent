@@ -120,14 +120,31 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _kanban_config() -> dict:
+def _kanban_config(board: Optional[str] = None) -> dict:
+    """Return global Kanban config merged with optional per-board overrides.
+
+    Board overrides live in ``board.json`` under either ``kanban`` or
+    ``dispatcher``. The global config remains the default, while project boards
+    such as SuperOptions can independently set higher concurrency, protected
+    Review capacity, and backlog thresholds without changing lightweight boards.
+    """
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
         kanban = cfg.get("kanban") or {}
-        return kanban if isinstance(kanban, dict) else {}
+        merged = dict(kanban) if isinstance(kanban, dict) else {}
     except Exception:
-        return {}
+        merged = {}
+    if board:
+        try:
+            meta = read_board_metadata(board)
+            for key in ("kanban", "dispatcher"):
+                overrides = meta.get(key)
+                if isinstance(overrides, dict):
+                    merged.update(overrides)
+        except Exception:
+            pass
+    return merged
 
 
 def review_gate_enabled() -> bool:
@@ -5606,6 +5623,230 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+def _kanban_int_config(
+    key: str,
+    default: Optional[int] = None,
+    *,
+    minimum: int = 0,
+) -> Optional[int]:
+    value = _kanban_config().get(key)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
+
+
+def _kanban_bool_config(key: str, default: bool = False) -> bool:
+    value = _kanban_config().get(key)
+    if value is None:
+        return default
+    return _truthy(value)
+
+
+def _kanban_str_config(key: str, default: str = "") -> str:
+    value = _kanban_config().get(key)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _resolve_review_reserved_slots(total_capacity: Optional[int]) -> int:
+    """Return the configured Review-lane reservation for a board tick.
+
+    ``review_reserved_slots`` is exact. If omitted,
+    ``review_reserved_ratio`` derives a floor-1 reservation from the total
+    concurrency cap. A reservation only has meaning with a finite total cap.
+    """
+    if total_capacity is None or total_capacity <= 0:
+        return 0
+    raw_slots = _kanban_config().get("review_reserved_slots")
+    if raw_slots not in (None, ""):
+        try:
+            return max(0, min(total_capacity, int(raw_slots)))
+        except (TypeError, ValueError):
+            return 0
+    raw_ratio = _kanban_config().get("review_reserved_ratio")
+    if raw_ratio in (None, ""):
+        return 0
+    try:
+        ratio = float(raw_ratio)
+    except (TypeError, ValueError):
+        return 0
+    if ratio <= 0:
+        return 0
+    slots = int(total_capacity * ratio)
+    if ratio > 0 and slots == 0:
+        slots = 1
+    return max(0, min(total_capacity, slots))
+
+
+def _running_review_count(conn: sqlite3.Connection) -> int:
+    """Count active running tasks whose current run started in Review.
+
+    Lane accounting intentionally keys on run origin, not assignee name, so
+    merge-captain maintenance tasks that start from Ready remain in the
+    implementation/normal lane while Review-column cards consume protected
+    review capacity.
+    """
+    rows = conn.execute(
+        "SELECT id, current_run_id FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    count = 0
+    for row in rows:
+        if _run_started_from_review(conn, row["id"], row["current_run_id"]):
+            count += 1
+    return count
+
+
+def _review_backlog_count(conn: sqlite3.Connection) -> int:
+    """Count cards in the Review/merge queue, including claimed reviews."""
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
+        ).fetchone()[0]
+    )
+
+
+def _implementation_branch_name(task: Task) -> str:
+    branch = (task.branch_name or "").strip()
+    return branch or f"wt/{task.id}"
+
+
+def _run_git(repo: Path, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def _git_repo_root(path: Path) -> Optional[Path]:
+    try:
+        proc = _run_git(path, ["rev-parse", "--show-toplevel"])
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    root = proc.stdout.strip()
+    return Path(root) if root else None
+
+
+def _repo_root_for_worktree_task(
+    task: Task,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+) -> Optional[Path]:
+    candidates: list[Path] = []
+    if workspace.exists():
+        candidates.append(workspace)
+    try:
+        default_workdir = read_board_metadata(board).get("default_workdir")
+    except Exception:
+        default_workdir = None
+    if default_workdir:
+        candidates.append(Path(str(default_workdir)).expanduser())
+    if task.workspace_path:
+        p = Path(task.workspace_path).expanduser()
+        candidates.extend([p.parent, *p.parents])
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        root = _git_repo_root(candidate)
+        if root is not None:
+            return root
+    return None
+
+
+def _ensure_fresh_base_for_implementation(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Prepare or validate a worktree implementation branch.
+
+    Returns ``None`` when the implementation may be spawned. Returns a
+    human-readable blocker when the dispatcher must not silently start a stale
+    branch. Review-origin runs skip this check; the merge captain performs PR
+    head/base checks in the Review protocol.
+    """
+    if (task.workspace_kind or "scratch") != "worktree":
+        return None
+    if task.status == "review" or _run_started_from_review(conn, task.id, task.current_run_id):
+        return None
+
+    repo = _repo_root_for_worktree_task(task, workspace, board=board)
+    if repo is None:
+        return (
+            f"fresh-base preflight failed for {task.id}: workspace_kind=worktree "
+            "but no git repository could be found from the workspace path or "
+            "board.default_workdir. Set the board default workdir to the repo "
+            "checkout or provide an existing absolute worktree path."
+        )
+
+    base_branch = _kanban_str_config("implementation_base_branch", "main")
+    fetch = _run_git(repo, ["fetch", "origin", base_branch])
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout or "unknown git fetch failure").strip()
+        return (
+            f"fresh-base preflight failed for {task.id}: could not fetch "
+            f"origin/{base_branch} in {repo}: {detail}"
+        )
+
+    base_ref = f"origin/{base_branch}"
+    base_sha = _run_git(repo, ["rev-parse", "--verify", base_ref]).stdout.strip()
+    if not base_sha:
+        return (
+            f"fresh-base preflight failed for {task.id}: {base_ref} is not "
+            f"available after fetch in {repo}."
+        )
+
+    branch = _implementation_branch_name(task)
+    branch_ref = f"refs/heads/{branch}"
+    exists = _run_git(repo, ["show-ref", "--verify", "--quiet", branch_ref])
+    if exists.returncode == 0:
+        ancestor = _run_git(repo, ["merge-base", "--is-ancestor", base_ref, branch])
+        if ancestor.returncode != 0:
+            return (
+                f"fresh-base preflight blocked {task.id}: branch {branch!r} is "
+                f"not based on current {base_ref} ({base_sha[:12]}). Rebase "
+                f"or recreate the branch from {base_ref}, then unblock/retry."
+            )
+        return None
+
+    create = _run_git(repo, ["branch", branch, base_ref])
+    if create.returncode != 0:
+        detail = (create.stderr or create.stdout or "unknown git branch failure").strip()
+        return (
+            f"fresh-base preflight failed for {task.id}: could not create "
+            f"branch {branch!r} from {base_ref} ({base_sha[:12]}): {detail}"
+        )
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task.id,
+            "fresh_base_prepared",
+            {
+                "repo": str(repo),
+                "base_branch": base_branch,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+                "branch": branch,
+            },
+            run_id=task.current_run_id,
+        )
+    return None
+
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -5744,50 +5985,98 @@ def dispatch_once(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+    review_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+
+    # Honour kanban.max_in_progress and max_spawn as live concurrency caps.
+    # When Review-lane reservations are configured, split the remaining live
+    # capacity by run origin/status instead of assignee name: Review-column
+    # work gets protected capacity, while merge-captain tasks that start from
+    # Ready are treated as normal implementation/maintenance work.
+    total_capacity: Optional[int]
+    if max_spawn is not None and max_in_progress is not None:
+        total_capacity = min(int(max_spawn), int(max_in_progress))
+    elif max_spawn is not None:
+        total_capacity = int(max_spawn)
+    elif max_in_progress is not None:
+        total_capacity = int(max_in_progress)
+    else:
+        total_capacity = None
+    if total_capacity is not None and total_capacity < 1:
+        return result
+
+    running_total = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    if total_capacity is not None and running_total >= total_capacity:
+        return result
+
+    review_backlog = _review_backlog_count(conn)
+    reserved_review_slots = _resolve_review_reserved_slots(total_capacity)
+    lane_reservations_active = total_capacity is not None and reserved_review_slots > 0
+    review_running = _running_review_count(conn) if lane_reservations_active else 0
+    implementation_running = max(0, running_total - review_running)
+    backlog_threshold = _kanban_int_config(
+        "review_backlog_pause_threshold", None, minimum=0,
+    )
+    implementation_paused = (
+        backlog_threshold is not None and review_backlog > backlog_threshold
+    )
+    allow_implementation_borrow = _kanban_bool_config(
+        "review_allow_implementation_borrow", False,
+    )
+
+    unlimited = 10**9
+    if lane_reservations_active:
+        review_lane_cap = reserved_review_slots
+        normal_impl_cap = max(0, total_capacity - reserved_review_slots)
+        if review_backlog == 0 and allow_implementation_borrow:
+            # Optional burst mode: implementation may borrow idle review
+            # capacity only while no Review backlog exists. The default keeps
+            # the reservation empty so a Review card arriving next tick is not
+            # starved behind a full board of implementation workers.
+            implementation_lane_cap = total_capacity
+        else:
+            implementation_lane_cap = normal_impl_cap
+        review_remaining = max(0, review_lane_cap - review_running)
+        implementation_remaining = max(0, implementation_lane_cap - implementation_running)
+        if implementation_paused:
+            implementation_remaining = 0
+    else:
+        remaining_total = (
+            max(0, total_capacity - running_total)
+            if total_capacity is not None else unlimited
+        )
+        review_remaining = remaining_total
+        implementation_remaining = 0 if implementation_paused else remaining_total
+
     spawned = 0
-    for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
+
+    def _total_full() -> bool:
+        return total_capacity is not None and running_total + spawned >= total_capacity
+
+    def _profile_spawnable(row: sqlite3.Row) -> bool:
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
-            continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+            return False
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
-            continue
+            return False
+        return True
+
+    def _spawn_ready(row: sqlite3.Row) -> bool:
+        nonlocal spawned
+        if _total_full():
+            return False
+        if not _profile_spawnable(row):
+            return False
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -5799,24 +6088,35 @@ def dispatch_once(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
-            continue
+            return False
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
-            continue
+            spawned += 1
+            return True
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
+            return False
         try:
             workspace = resolve_workspace(claimed, board=board)
+            fresh_base_blocker = _ensure_fresh_base_for_implementation(
+                conn, claimed, workspace, board=board,
+            )
+            if fresh_base_blocker:
+                block_task(
+                    conn,
+                    claimed.id,
+                    reason=fresh_base_blocker,
+                    expected_run_id=claimed.current_run_id,
+                    metadata={"fresh_base_blocked": True},
+                )
+                result.auto_blocked.append(claimed.id)
+                return False
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -5824,7 +6124,7 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
-            continue
+            return False
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -5853,6 +6153,7 @@ def dispatch_once(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            return True
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -5860,40 +6161,21 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            return False
 
-    # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
-    #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
-    for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+    def _spawn_review(row: sqlite3.Row) -> bool:
+        nonlocal spawned
+        if _total_full():
+            return False
+        if not _profile_spawnable(row):
+            return False
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
-            continue
+            spawned += 1
+            return True
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
+            return False
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -5903,7 +6185,7 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
-            continue
+            return False
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -5928,6 +6210,7 @@ def dispatch_once(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            return True
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -5935,6 +6218,37 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            return False
+
+    # Reserved-lane mode prioritizes Review work first so protected capacity is
+    # actually consumed by Review cards. Legacy/no-reservation mode keeps the
+    # historical Ready-first ordering for compatibility.
+    if lane_reservations_active:
+        review_claims = 0
+        for row in review_rows:
+            if review_claims >= review_remaining:
+                break
+            if _spawn_review(row):
+                review_claims += 1
+        implementation_claims = 0
+        for row in ready_rows:
+            if implementation_claims >= implementation_remaining:
+                break
+            if _spawn_ready(row):
+                implementation_claims += 1
+    else:
+        implementation_claims = 0
+        for row in ready_rows:
+            if implementation_claims >= implementation_remaining:
+                break
+            if _spawn_ready(row):
+                implementation_claims += 1
+        review_claims = 0
+        for row in review_rows:
+            if review_claims >= review_remaining:
+                break
+            if _spawn_review(row):
+                review_claims += 1
     return result
 
 
@@ -6279,7 +6593,12 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
-    if task.branch_name:
+    if task.workspace_kind == "worktree":
+        env["HERMES_KANBAN_BRANCH"] = _implementation_branch_name(task)
+        env["HERMES_KANBAN_BASE_BRANCH"] = _kanban_str_config(
+            "implementation_base_branch", "main",
+        )
+    elif task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
@@ -6351,13 +6670,13 @@ def _default_spawn(
     if task.skills:
         for sk in task.skills:
             if sk and sk != "kanban-worker":
-                if _skill_available(env.get("HERMES_HOME"), sk):
-                    cmd.extend(["--skills", sk])
-                else:
-                    _log.warning(
-                        "Skipping unresolved kanban worker skill %s for profile %s",
-                        sk, profile_arg,
-                    )
+                # Task-level skills are explicit dispatch policy. Pass them
+                # through even when they do not resolve in the dispatcher's
+                # current profile root: the worker CLI may resolve bundled, hub,
+                # qualified, or profile-local skills after profile activation.
+                # Pre-validating here incorrectly strips requested specialist
+                # context from workers and hides configuration mistakes.
+                cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([
@@ -6519,6 +6838,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    elif task.workspace_kind == "worktree":
+        lines.append(f"Branch:   {_implementation_branch_name(task)}")
     lines.append("")
 
     review_run = _run_started_from_review(conn, task_id, task.current_run_id)
@@ -6553,6 +6874,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 f"the merge captain ({merge_captain_profile()}); implementation workers must "
                 "not bypass Review or merge their own parallel PRs."
             )
+            if task.workspace_kind == "worktree":
+                base_branch = _kanban_str_config("implementation_base_branch", "main")
+                lines.append(
+                    "Fresh-base worktree start is required: fetch origin, base/rebase "
+                    f"{_implementation_branch_name(task)!r} on the current origin/{base_branch}, "
+                    "and do not continue from a stale local checkout. If the dispatcher "
+                    "blocked this card for stale base, rebase or recreate the branch from "
+                    f"origin/{base_branch} before unblocking."
+                )
             lines.append("")
 
     if task.body and task.body.strip():

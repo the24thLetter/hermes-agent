@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import types
@@ -696,10 +697,14 @@ def test_detect_crashed_review_worker_returns_to_review(
         host = _kb._claimer_id().split(":", 1)[0]
         claimed = kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer")
         assert claimed is not None
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (81000, tid))
+        old_started = int(time.time()) - (_kb.DEFAULT_CRASH_GRACE_SECONDS + 1)
         conn.execute(
-            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-            (81000, claimed.current_run_id),
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 81000, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 81000, claimed.current_run_id),
         )
         conn.commit()
 
@@ -2953,6 +2958,216 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 
     assert len(spawns) == 4, f"expected 4 spawns (unlimited), got {len(spawns)}"
 
+
+# ---------------------------------------------------------------------------
+# dispatch_once — Review lane reservations / backlog pressure
+# ---------------------------------------------------------------------------
+
+
+def _lane_config(**overrides):
+    cfg = {
+        "review_reserved_slots": 4,
+        "review_backlog_pause_threshold": 6,
+        "review_allow_implementation_borrow": False,
+        "implementation_base_branch": "main",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def test_dispatch_reserved_review_slots_claim_review_first(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.id, task.status))
+        return 42
+
+    with kb.connect() as conn:
+        ready = [kb.create_task(conn, title=f"ready {i}", assignee="alice") for i in range(6)]
+        review = [kb.create_task(conn, title=f"review {i}", assignee="mergecaptain") for i in range(4)]
+        for tid in review:
+            _set_task_status(conn, tid, "review")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+
+    assert [tid for tid, _ in spawned[:4]] == review
+    assert [status for _, status in spawned[:4]] == ["running"] * 4
+    assert [tid for tid, _ in spawned[4:]] == ready[:4]
+    assert len(spawned) == 8
+
+
+def test_dispatch_implementation_capped_to_non_review_lane_when_review_backlog_exists(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        ready = [kb.create_task(conn, title=f"ready {i}", assignee="alice") for i in range(10)]
+        review = [kb.create_task(conn, title=f"review {i}", assignee="mergecaptain") for i in range(2)]
+        for tid in review:
+            _set_task_status(conn, tid, "review")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+
+    assert spawned[:2] == review
+    assert spawned[2:] == ready[:4]
+    assert len(spawned) == 6
+
+
+def test_dispatch_backpressure_pauses_new_implementation_when_review_backlog_above_threshold(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        for i in range(10):
+            kb.create_task(conn, title=f"ready {i}", assignee="alice")
+        review = [kb.create_task(conn, title=f"review {i}", assignee="mergecaptain") for i in range(7)]
+        for tid in review:
+            _set_task_status(conn, tid, "review")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+
+    assert spawned == review[:4]
+
+
+def test_dispatch_implementation_resumes_after_review_backlog_drains(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        ready = [kb.create_task(conn, title=f"ready {i}", assignee="alice") for i in range(10)]
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+
+    assert spawned == ready[:4]
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _make_repo_with_origin(tmp_path: Path) -> tuple[Path, Path]:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, stdout=subprocess.PIPE)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", str(origin), str(repo)], check=True, stdout=subprocess.PIPE)
+    _git(repo, "config", "user.email", "kanban@example.test")
+    _git(repo, "config", "user.name", "Kanban Test")
+    (repo / "file.txt").write_text("base 1\n")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-m", "base 1")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "push", "-u", "origin", "main")
+    return repo, origin
+
+
+def test_dispatch_worktree_implementation_branch_starts_from_latest_base(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    repo, _origin = _make_repo_with_origin(tmp_path)
+    (repo / "file.txt").write_text("base 2\n")
+    _git(repo, "commit", "-am", "base 2")
+    _git(repo, "push", "origin", "main")
+    latest = _git(repo, "rev-parse", "origin/main")
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    kb.create_board("fresh-base", default_workdir=str(repo))
+    with kb.connect(board="fresh-base") as conn:
+        tid = kb.create_task(
+            conn,
+            title="impl",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "wt"),
+            branch_name="feature/fresh-base",
+            board="fresh-base",
+        )
+        kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=8,
+            max_in_progress=8,
+            board="fresh-base",
+        )
+
+    assert spawned == [tid]
+    assert _git(repo, "rev-parse", "feature/fresh-base") == latest
+
+
+def test_dispatch_blocks_stale_worktree_branch_with_rebase_guidance(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(kb, "_kanban_config", lambda: _lane_config())
+    repo, _origin = _make_repo_with_origin(tmp_path)
+    old_base = _git(repo, "rev-parse", "origin/main")
+    _git(repo, "branch", "feature/stale", old_base)
+    (repo / "file.txt").write_text("base 2\n")
+    _git(repo, "commit", "-am", "base 2")
+    _git(repo, "push", "origin", "main")
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    kb.create_board("stale-base", default_workdir=str(repo))
+    with kb.connect(board="stale-base") as conn:
+        tid = kb.create_task(
+            conn,
+            title="impl",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "wt"),
+            branch_name="feature/stale",
+            board="stale-base",
+        )
+        kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=8,
+            max_in_progress=8,
+            board="stale-base",
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+
+    assert spawned == []
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.last_failure_error is None
+    assert run is not None
+    assert run.status == "blocked"
+    assert "rebase" in (run.summary or "").lower()
+
+
 # Review column dispatch
 # ---------------------------------------------------------------------------
 
@@ -3105,8 +3320,17 @@ def test_review_origin_crash_breaker_keeps_restore_status_metadata(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review crash", assignee="alice", max_retries=1)
         _set_task_status(conn, t, "review")
-        assert kb.claim_review_task(conn, t) is not None
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (99999999, t))
+        claimed = kb.claim_review_task(conn, t)
+        assert claimed is not None
+        old_started = int(time.time()) - (kb.DEFAULT_CRASH_GRACE_SECONDS + 1)
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 99999999, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 99999999, claimed.current_run_id),
+        )
 
         crashed = kb.detect_crashed_workers(conn)
         task = kb.get_task(conn, t)
