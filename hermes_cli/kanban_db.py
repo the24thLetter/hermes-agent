@@ -5218,6 +5218,16 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    review_backlog_count: int = 0
+    """Backpressure count: Review cards/runs plus active tasks with PR URLs."""
+    open_pr_count: int = 0
+    """Distinct GitHub PR URLs mapped to active queue tasks."""
+    oldest_review_age_seconds: Optional[int] = None
+    implementation_paused: bool = False
+    review_lane_used: int = 0
+    review_lane_reserved: int = 0
+    implementation_lane_used: int = 0
+    implementation_lane_capacity: Optional[int] = None
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6320,8 +6330,9 @@ def _kanban_int_config(
     default: Optional[int] = None,
     *,
     minimum: int = 0,
+    board: Optional[str] = None,
 ) -> Optional[int]:
-    value = _kanban_config().get(key)
+    value = _kanban_config(board).get(key)
     if value is None or value == "":
         return default
     try:
@@ -6331,22 +6342,22 @@ def _kanban_int_config(
     return parsed if parsed >= minimum else default
 
 
-def _kanban_bool_config(key: str, default: bool = False) -> bool:
-    value = _kanban_config().get(key)
+def _kanban_bool_config(key: str, default: bool = False, *, board: Optional[str] = None) -> bool:
+    value = _kanban_config(board).get(key)
     if value is None:
         return default
     return _truthy(value)
 
 
-def _kanban_str_config(key: str, default: str = "") -> str:
-    value = _kanban_config().get(key)
+def _kanban_str_config(key: str, default: str = "", *, board: Optional[str] = None) -> str:
+    value = _kanban_config(board).get(key)
     if value is None:
         return default
     text = str(value).strip()
     return text or default
 
 
-def _resolve_review_reserved_slots(total_capacity: Optional[int]) -> int:
+def _resolve_review_reserved_slots(total_capacity: Optional[int], *, board: Optional[str] = None) -> int:
     """Return the configured Review-lane reservation for a board tick.
 
     ``review_reserved_slots`` is exact. If omitted,
@@ -6355,13 +6366,13 @@ def _resolve_review_reserved_slots(total_capacity: Optional[int]) -> int:
     """
     if total_capacity is None or total_capacity <= 0:
         return 0
-    raw_slots = _kanban_config().get("review_reserved_slots")
+    raw_slots = _kanban_config(board).get("review_reserved_slots")
     if raw_slots not in (None, ""):
         try:
             return max(0, min(total_capacity, int(raw_slots)))
         except (TypeError, ValueError):
             return 0
-    raw_ratio = _kanban_config().get("review_reserved_ratio")
+    raw_ratio = _kanban_config(board).get("review_reserved_ratio")
     if raw_ratio in (None, ""):
         return 0
     try:
@@ -6394,13 +6405,147 @@ def _running_review_count(conn: sqlite3.Connection) -> int:
     return count
 
 
-def _review_backlog_count(conn: sqlite3.Connection) -> int:
-    """Count cards in the Review/merge queue, including claimed reviews."""
-    return int(
-        conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
-        ).fetchone()[0]
+def _review_lane_task_ids(conn: sqlite3.Connection) -> set[str]:
+    """Task ids currently occupying or waiting for the protected Review lane."""
+    ids = {row["id"] for row in conn.execute("SELECT id FROM tasks WHERE status = 'review'")}
+    for row in conn.execute(
+        "SELECT id, current_run_id FROM tasks WHERE status = 'running'"
+    ).fetchall():
+        if _run_started_from_review(conn, row["id"], row["current_run_id"]):
+            ids.add(row["id"])
+    return ids
+
+
+def _text_pr_urls(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    return set(_RESPAWN_GUARD_PR_URL_RE.findall(str(text)))
+
+
+def _active_task_pr_index(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
+    """Return (task_ids, github_pr_urls) referenced by active queue tasks.
+
+    This is intentionally local/cheap: it maps GitHub PR URLs already recorded
+    in comments, run summaries/metadata, or events back to tasks that are still
+    ready/running/review/blocked. It catches PR-backed cards bounced from Review
+    back to implementation without requiring every dispatcher tick to call the
+    GitHub API.
+    """
+    active_ids = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('ready', 'running', 'review', 'blocked')"
+        ).fetchall()
+    }
+    if not active_ids:
+        return set(), set()
+    task_ids: set[str] = set()
+    urls: set[str] = set()
+    placeholders = ",".join("?" for _ in active_ids)
+
+    def _record(tid: str, text: Optional[str]) -> None:
+        if tid not in active_ids:
+            return
+        found = _text_pr_urls(text)
+        if found:
+            task_ids.add(tid)
+            urls.update(found)
+
+    for row in conn.execute(
+        f"SELECT task_id, body FROM task_comments WHERE task_id IN ({placeholders})",
+        tuple(active_ids),
+    ).fetchall():
+        _record(row["task_id"], row["body"])
+    for row in conn.execute(
+        f"SELECT task_id, payload FROM task_events WHERE task_id IN ({placeholders})",
+        tuple(active_ids),
+    ).fetchall():
+        _record(row["task_id"], row["payload"])
+    for row in conn.execute(
+        f"SELECT task_id, summary, metadata, error FROM task_runs WHERE task_id IN ({placeholders})",
+        tuple(active_ids),
+    ).fetchall():
+        _record(row["task_id"], row["summary"])
+        _record(row["task_id"], row["metadata"])
+        _record(row["task_id"], row["error"])
+    return task_ids, urls
+
+
+def review_pressure_counts(conn: sqlite3.Connection, *, board: Optional[str] = None) -> dict[str, Any]:
+    """Return merge-train pressure metrics for dispatch/status surfaces."""
+    review_ids = _review_lane_task_ids(conn)
+    include_prs = _kanban_bool_config("review_backlog_include_prs", True, board=board)
+    pr_task_ids: set[str] = set()
+    pr_urls: set[str] = set()
+    if include_prs:
+        pr_task_ids, pr_urls = _active_task_pr_index(conn)
+    pressure_task_ids = review_ids | pr_task_ids
+    oldest_row = conn.execute(
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'review'"
+    ).fetchone()
+    now = int(time.time())
+    oldest_review_age = (
+        now - int(oldest_row["ts"])
+        if oldest_row and oldest_row["ts"] is not None else None
     )
+    return {
+        "review_backlog_count": len(pressure_task_ids),
+        "review_cards": int(conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'review'").fetchone()[0]),
+        "review_running": _running_review_count(conn),
+        "active_pr_task_count": len(pr_task_ids),
+        "open_pr_count": len(pr_urls),
+        "oldest_review_age_seconds": oldest_review_age,
+        "task_ids": sorted(pressure_task_ids),
+    }
+
+
+def _review_backlog_count(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
+    """Count current Review/PR merge pressure for backpressure decisions."""
+    return int(review_pressure_counts(conn, board=board)["review_backlog_count"])
+
+
+def _set_board_dispatch_state(board: Optional[str], key: str, value: Any) -> None:
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = read_board_metadata(slug)
+    state = meta.get("dispatch_state")
+    if not isinstance(state, dict):
+        state = {}
+    if state.get(key) == value:
+        return
+    state[key] = value
+    meta["dispatch_state"] = state
+    meta.pop("db_path", None)
+    path = board_metadata_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _board_dispatch_state(board: Optional[str]) -> dict[str, Any]:
+    state = read_board_metadata(board).get("dispatch_state")
+    return state if isinstance(state, dict) else {}
+
+
+def _implementation_pause_state(
+    backlog_count: int,
+    *,
+    board: Optional[str] = None,
+    persist: bool = True,
+) -> bool:
+    """Apply pause/resume hysteresis for new implementation claims."""
+    pause_threshold = _kanban_int_config(
+        "review_backlog_pause_threshold", None, minimum=0, board=board,
+    )
+    if pause_threshold is None:
+        return False
+    resume_threshold = _kanban_int_config(
+        "review_backlog_resume_threshold", None, minimum=0, board=board,
+    )
+    if resume_threshold is None:
+        resume_threshold = max(0, pause_threshold - 3)
+    was_paused = bool(_board_dispatch_state(board).get("implementation_paused_due_to_review_backlog"))
+    paused = backlog_count > (resume_threshold if was_paused else pause_threshold)
+    if persist and paused != was_paused:
+        _set_board_dispatch_state(board, "implementation_paused_due_to_review_backlog", paused)
+    return paused
 
 
 def _implementation_branch_name(task: Task) -> str:
@@ -6484,7 +6629,7 @@ def _ensure_fresh_base_for_implementation(
             "checkout or provide an existing absolute worktree path."
         )
 
-    base_branch = _kanban_str_config("implementation_base_branch", "main")
+    base_branch = _kanban_str_config("implementation_base_branch", "main", board=board)
     fetch = _run_git(repo, ["fetch", "origin", base_branch])
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout or "unknown git fetch failure").strip()
@@ -6667,20 +6812,21 @@ def dispatch_once(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
-    running_count = 0
-    if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+    # Per-board overrides win over gateway/global arguments so project boards
+    # can reserve lanes or run at higher capacity without raising every board.
+    board_cfg = _kanban_config(board)
+
+    def _optional_positive_int(value: Any, fallback: Optional[int]) -> Optional[int]:
+        if value is None or value == "":
+            return fallback
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed > 0 else fallback
+
+    max_spawn = _optional_positive_int(board_cfg.get("max_spawn"), max_spawn)
+    max_in_progress = _optional_positive_int(board_cfg.get("max_in_progress"), max_in_progress)
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
@@ -6716,19 +6862,25 @@ def dispatch_once(
     if total_capacity is not None and running_total >= total_capacity:
         return result
 
-    review_backlog = _review_backlog_count(conn)
-    reserved_review_slots = _resolve_review_reserved_slots(total_capacity)
+    pressure = review_pressure_counts(conn, board=board)
+    review_backlog = int(pressure["review_backlog_count"])
+    result.review_backlog_count = review_backlog
+    result.open_pr_count = int(pressure["open_pr_count"])
+    result.oldest_review_age_seconds = pressure.get("oldest_review_age_seconds")
+    reserved_review_slots = _resolve_review_reserved_slots(total_capacity, board=board)
     lane_reservations_active = total_capacity is not None and reserved_review_slots > 0
     review_running = _running_review_count(conn) if lane_reservations_active else 0
     implementation_running = max(0, running_total - review_running)
-    backlog_threshold = _kanban_int_config(
-        "review_backlog_pause_threshold", None, minimum=0,
+    implementation_paused = _implementation_pause_state(
+        review_backlog,
+        board=board,
+        persist=not dry_run,
     )
-    implementation_paused = (
-        backlog_threshold is not None and review_backlog > backlog_threshold
-    )
+    result.implementation_paused = implementation_paused
+    result.review_lane_used = review_running
+    result.review_lane_reserved = reserved_review_slots
     allow_implementation_borrow = _kanban_bool_config(
-        "review_allow_implementation_borrow", False,
+        "review_allow_implementation_borrow", False, board=board,
     )
 
     unlimited = 10**9
@@ -7433,7 +7585,7 @@ def _default_spawn(
     if task.workspace_kind == "worktree":
         env["HERMES_KANBAN_BRANCH"] = _implementation_branch_name(task)
         env["HERMES_KANBAN_BASE_BRANCH"] = _kanban_str_config(
-            "implementation_base_branch", "main",
+            "implementation_base_branch", "main", board=board,
         )
     elif task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -7722,7 +7874,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "not bypass Review or merge their own parallel PRs."
             )
             if task.workspace_kind == "worktree":
-                base_branch = _kanban_str_config("implementation_base_branch", "main")
+                base_branch = _kanban_str_config(
+                    "implementation_base_branch", "main", board=board,
+                )
                 lines.append(
                     "Fresh-base worktree start is required: fetch origin, base/rebase "
                     f"{_implementation_branch_name(task)!r} on the current origin/{base_branch}, "
