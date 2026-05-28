@@ -696,6 +696,10 @@ Recommended SuperOptions operating values are the example above: total worker
 capacity 8, Review reserved slots 4, implementation pause when Review/open-PR
 pressure is greater than 6, resume at 3, `mergecaptain` as the Review owner,
 and the Cursor/Bugbot + GitHub PR workflow skills loaded for Review workers.
+Review workers must treat any Cursor/Bugbot output that says "previously
+reported issue(s) remain unresolved" as merge-blocking even if the same check
+says no new issues or `issueCount=0`; the prior findings must be fixed or
+explicitly dispositioned in the PR summary before completion.
 Use per-board metadata overrides when another board needs lower concurrency or
 different thresholds than the global `kanban:` defaults.
 
