@@ -34,11 +34,58 @@ declare global {
 }
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
+const AUTH_REDIRECT_SENTINEL = "hermes.authRedirectAttempted";
+const AUTH_REDIRECT_WINDOW_NAME_SENTINEL = "hermes-auth-redirect-attempted";
 
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
     headers.set(SESSION_HEADER, token);
   }
+}
+
+function getWindowNameParts(): string[] {
+  return (window.name || "").split("|").filter(Boolean);
+}
+
+function hasWindowNameSentinel(): boolean {
+  return getWindowNameParts().includes(AUTH_REDIRECT_WINDOW_NAME_SENTINEL);
+}
+
+function setWindowNameSentinel(): void {
+  if (!hasWindowNameSentinel()) {
+    window.name = [...getWindowNameParts(), AUTH_REDIRECT_WINDOW_NAME_SENTINEL].join("|");
+  }
+}
+
+function clearWindowNameSentinel(): void {
+  const rest = getWindowNameParts().filter((part) => part !== AUTH_REDIRECT_WINDOW_NAME_SENTINEL);
+  window.name = rest.join("|");
+}
+
+function markAuthRedirectAttempted(): boolean {
+  try {
+    if (sessionStorage.getItem(AUTH_REDIRECT_SENTINEL) === "1") {
+      return false;
+    }
+    sessionStorage.setItem(AUTH_REDIRECT_SENTINEL, "1");
+    setWindowNameSentinel();
+    return true;
+  } catch {
+    if (hasWindowNameSentinel()) {
+      return false;
+    }
+    setWindowNameSentinel();
+    return true;
+  }
+}
+
+function clearAuthRedirectAttempted(): void {
+  try {
+    sessionStorage.removeItem(AUTH_REDIRECT_SENTINEL);
+  } catch {
+    /* privacy mode / disabled storage — window.name fallback below */
+  }
+  clearWindowNameSentinel();
 }
 
 // ── Global management-profile scope ──────────────────────────────────
@@ -125,6 +172,9 @@ export async function fetchJSON<T>(
       (body.error === "unauthenticated" || body.error === "session_expired") &&
       body.login_url
     ) {
+      if (!markAuthRedirectAttempted()) {
+        throw new Error("Authentication redirect already attempted");
+      }
       // Preserve where the user was so /auth/callback can land them back
       // after re-auth. The gate's login_url already carries a ``next=``
       // built from the request path, but the SPA may be deep inside a
@@ -185,6 +235,7 @@ export async function fetchJSON<T>(
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
   }
+  clearAuthRedirectAttempted();
   return res.json();
 }
 
