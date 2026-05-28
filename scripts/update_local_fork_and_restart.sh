@@ -19,6 +19,8 @@ DRY_RUN=0
 ALLOW_HERMES_HOME_OVERRIDE=0
 HERMES_HOME_EXPLICIT=0
 MANUAL_GATEWAY_FALLBACK=0
+GATEWAY_LOG_OFFSET=0
+GATEWAY_MANUAL_FALLBACK_LOG_OFFSET=0
 GATEWAY_ERROR_OFFSET=0
 
 usage() {
@@ -168,12 +170,25 @@ ensure_clean_checkout() {
 }
 
 record_gateway_error_offset() {
+  local gateway_log="$HERMES_HOME/logs/gateway.log"
+  local manual_log="$HERMES_HOME/logs/gateway.manual-fallback.log"
   local err_log="$HERMES_HOME/logs/gateway.error.log"
+  if [ -f "$gateway_log" ]; then
+    GATEWAY_LOG_OFFSET="$(wc -c < "$gateway_log" | tr -d '[:space:]')"
+  else
+    GATEWAY_LOG_OFFSET=0
+  fi
+  if [ -f "$manual_log" ]; then
+    GATEWAY_MANUAL_FALLBACK_LOG_OFFSET="$(wc -c < "$manual_log" | tr -d '[:space:]')"
+  else
+    GATEWAY_MANUAL_FALLBACK_LOG_OFFSET=0
+  fi
   if [ -f "$err_log" ]; then
     GATEWAY_ERROR_OFFSET="$(wc -c < "$err_log" | tr -d '[:space:]')"
   else
     GATEWAY_ERROR_OFFSET=0
   fi
+  log "gateway log offsets captured for post-restart dispatcher checks"
   log "gateway.error.log offset captured for post-restart SQLite/WAL check"
 }
 
@@ -359,6 +374,7 @@ restart_gateway() {
     MANUAL_GATEWAY_FALLBACK=1
     run mkdir -p "$HERMES_HOME/logs"
     run_shell "cd $(printf '%q' "$(pwd)") && env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes gateway run --replace > $(printf '%q' "$HERMES_HOME/logs/gateway.manual-fallback.log") 2>&1 &"
+    GATEWAY_MANUAL_FALLBACK_LOG_OFFSET=0
   fi
   verify_gui_launchagent_unloaded
 }
@@ -426,17 +442,75 @@ PY
 verify_gateway_status() {
   log "verifying gateway status and Telegram connection"
   run env HERMES_HOME="$HERMES_HOME" ./venv/bin/hermes gateway status
-  run env HERMES_HOME="$HERMES_HOME" ./venv/bin/hermes status --all
+  verify_telegram_connection
+}
+
+verify_telegram_connection() {
+  log "asserting Telegram platform is connected from gateway runtime status"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ HERMES_HOME=%q ./venv/bin/python - <<%s\n' "$HERMES_HOME" "'PY'"
+    printf '  # assert gateway_state.json platforms.telegram.state == connected (non-secret)\n'
+    return 0
+  fi
+  env HERMES_HOME="$HERMES_HOME" ./venv/bin/python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+status_path = Path(os.environ["HERMES_HOME"]) / "gateway_state.json"
+try:
+    payload = json.loads(status_path.read_text())
+except FileNotFoundError:
+    print(f"missing gateway runtime status: {status_path}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as exc:
+    print(f"invalid gateway runtime status JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+platforms = payload.get("platforms") or {}
+telegram = platforms.get("telegram") or {}
+state = telegram.get("state")
+if state != "connected":
+    code = telegram.get("error_code") or "none"
+    print(
+        "Telegram platform is not connected "
+        f"(state={state!r}, error_code={code!r}; message redacted)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print("Telegram platform connected")
+PY
 }
 
 verify_kanban_dispatcher_ticks() {
-  local gateway_log="$HERMES_HOME/logs/gateway.log"
-  [ -f "$gateway_log" ] || die "missing gateway log: $gateway_log"
-  if tail -n 500 "$gateway_log" | grep -Eiq 'kanban.*dispatch|dispatch.*kanban|dispatcher tick|spawned worker'; then
-    log "embedded Kanban dispatcher activity found in gateway log"
+  local gateway_log offset size start
+  if [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ]; then
+    gateway_log="$HERMES_HOME/logs/gateway.manual-fallback.log"
+    offset="$GATEWAY_MANUAL_FALLBACK_LOG_OFFSET"
   else
-    die "no embedded Kanban dispatcher activity found in recent gateway log"
+    gateway_log="$HERMES_HOME/logs/gateway.log"
+    offset="$GATEWAY_LOG_OFFSET"
   fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ tail -c +%s %q | grep -Eiq %q\n' "$((offset + 1))" "$gateway_log" 'kanban.*dispatch|dispatch.*kanban|dispatcher tick|spawned worker'
+    return 0
+  fi
+  start="$(date +%s)"
+  while [ $(( $(date +%s) - start )) -lt 90 ]; do
+    if [ -f "$gateway_log" ]; then
+      size="$(wc -c < "$gateway_log" | tr -d '[:space:]')"
+      if [ "$size" -lt "$offset" ]; then
+        offset=0
+      fi
+      if tail -c +$((offset + 1)) "$gateway_log" | grep -Eiq 'kanban.*dispatch|dispatch.*kanban|dispatcher tick|spawned worker'; then
+        log "post-restart embedded Kanban dispatcher activity found in $gateway_log"
+        return 0
+      fi
+    fi
+    sleep 3
+  done
+  die "no post-restart embedded Kanban dispatcher activity found in active gateway log: $gateway_log"
 }
 
 verify_kanban_boards_and_stats() {
