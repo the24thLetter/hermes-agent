@@ -34,11 +34,58 @@ declare global {
 }
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
+const AUTH_REDIRECT_SENTINEL = "hermes.authRedirectAttempted";
+const AUTH_REDIRECT_WINDOW_NAME_SENTINEL = "hermes-auth-redirect-attempted";
 
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
     headers.set(SESSION_HEADER, token);
   }
+}
+
+function getWindowNameParts(): string[] {
+  return (window.name || "").split("|").filter(Boolean);
+}
+
+function hasWindowNameSentinel(): boolean {
+  return getWindowNameParts().includes(AUTH_REDIRECT_WINDOW_NAME_SENTINEL);
+}
+
+function setWindowNameSentinel(): void {
+  if (!hasWindowNameSentinel()) {
+    window.name = [...getWindowNameParts(), AUTH_REDIRECT_WINDOW_NAME_SENTINEL].join("|");
+  }
+}
+
+function clearWindowNameSentinel(): void {
+  const rest = getWindowNameParts().filter((part) => part !== AUTH_REDIRECT_WINDOW_NAME_SENTINEL);
+  window.name = rest.join("|");
+}
+
+function markAuthRedirectAttempted(): boolean {
+  try {
+    if (sessionStorage.getItem(AUTH_REDIRECT_SENTINEL) === "1") {
+      return false;
+    }
+    sessionStorage.setItem(AUTH_REDIRECT_SENTINEL, "1");
+    setWindowNameSentinel();
+    return true;
+  } catch {
+    if (hasWindowNameSentinel()) {
+      return false;
+    }
+    setWindowNameSentinel();
+    return true;
+  }
+}
+
+function clearAuthRedirectAttempted(): void {
+  try {
+    sessionStorage.removeItem(AUTH_REDIRECT_SENTINEL);
+  } catch {
+    /* privacy mode / disabled storage — window.name fallback below */
+  }
+  clearWindowNameSentinel();
 }
 
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
@@ -73,6 +120,9 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
       (body.error === "unauthenticated" || body.error === "session_expired") &&
       body.login_url
     ) {
+      if (!markAuthRedirectAttempted()) {
+        throw new Error("Authentication redirect already attempted");
+      }
       // Preserve where the user was so /auth/callback can land them back
       // after re-auth. The gate's login_url already carries a ``next=``
       // built from the request path, but the SPA may be deep inside a
@@ -91,11 +141,49 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
       // Never resolve — the page is about to unload.
       return new Promise<T>(() => {});
     }
+    // Loopback mode: ``_SESSION_TOKEN`` rotates on every server restart
+    // (``hermes update``, ``hermes gateway restart``, etc.). A tab kept
+    // open across the restart holds the OLD token in
+    // ``window.__HERMES_SESSION_TOKEN__`` from the previous HTML render,
+    // so every fetch returns 401. The HTML is served ``Cache-Control:
+    // no-store`` so a reload picks up the freshly-injected token. Trigger
+    // that reload once on the first stale-token 401 — gated mode is
+    // handled above, so reaching here in gated mode means a real
+    // middleware failure that should not reload-loop.
+    if (!window.__HERMES_AUTH_REQUIRED__) {
+      let alreadyReloaded = false;
+      try {
+        alreadyReloaded =
+          sessionStorage.getItem("hermes.tokenReloadAttempted") === "1";
+      } catch {
+        /* SSR / privacy mode — fall through to throw */
+      }
+      if (!alreadyReloaded) {
+        try {
+          sessionStorage.setItem("hermes.tokenReloadAttempted", "1");
+        } catch {
+          /* SSR / privacy mode — best effort */
+        }
+        window.location.reload();
+        return new Promise<T>(() => {});
+      }
+    }
+  }
+  if (res.ok) {
+    // Clear the stale-token reload guard: a successful 2xx proves the
+    // current ``window.__HERMES_SESSION_TOKEN__`` is valid, so the next
+    // 401 — if any — should be allowed to trigger its own reload cycle.
+    try {
+      sessionStorage.removeItem("hermes.tokenReloadAttempted");
+    } catch {
+      /* SSR / privacy mode — ignore */
+    }
   }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
   }
+  clearAuthRedirectAttempted();
   return res.json();
 }
 
