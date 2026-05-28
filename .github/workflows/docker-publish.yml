@@ -300,7 +300,7 @@ jobs:
   # so it runs in ~30 seconds.
   #
   # On main pushes: tags both :main and :latest.
-  # On releases: tags :<release_tag_name>.
+  # On releases: tags both :<release_tag_name> and :latest.
   # ---------------------------------------------------------------------------
   merge:
     if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
@@ -336,6 +336,7 @@ jobs:
             TAG="${{ github.event.release.tag_name }}"
             docker buildx imagetools create \
               -t "${IMAGE_NAME}:${TAG}" \
+              -t "${IMAGE_NAME}:latest" \
               "${args[@]}"
           else
             docker buildx imagetools create \

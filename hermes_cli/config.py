@@ -2222,6 +2222,40 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Optional live worker concurrency caps. ``max_spawn`` and
+        # ``max_in_progress`` are both interpreted as board-wide live caps;
+        # when both are set, the smaller wins. Set to 8 on project boards
+        # that reserve four Review slots plus four implementation slots.
+        "max_spawn": None,
+        "max_in_progress": None,
+        # Review gate / merge-train controls. By default OSS installs keep
+        # direct Done completion; project boards can turn the gate on and set
+        # the merge captain profile that owns Review-column cards.
+        "require_review_before_done": False,
+        "merge_captain_profile": "merge-captain",
+        "review_agent_skills": ["github/cursor-bugbot-sweep", "github/github-pr-workflow"],
+        # Optional Review-lane reservation and backlog backpressure. With
+        # max_spawn/max_in_progress=8 and review_reserved_slots=4, Review
+        # cards can consume four protected slots while implementation work is
+        # capped to the remaining four. If review_backlog_pause_threshold=6,
+        # no new Ready/implementation cards are claimed while more than six
+        # cards are in Review.
+        "review_reserved_slots": None,
+        "review_reserved_ratio": None,
+        "review_backlog_pause_threshold": None,
+        "review_backlog_resume_threshold": None,
+        "review_backlog_include_prs": True,
+        "review_allow_implementation_borrow": False,
+        # Optional merge-train guardrails surfaced to Review workers and
+        # status APIs. Final merges should be serialized per repo/base branch;
+        # parallel merge-captains may still inspect, poll checks, rebase, and
+        # prepare PR bodies before acquiring the merge mutex.
+        "merge_mutex_enabled": True,
+        "merge_mutex_ttl_seconds": 1800,
+        # Fresh-base guard for worktree implementation tasks. The dispatcher
+        # fetches origin/<branch>, creates missing implementation branches from
+        # that ref, and blocks stale existing branches with rebase guidance.
+        "implementation_base_branch": "main",
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
