@@ -118,15 +118,19 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
-    """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
-        return metadata
-    session_id = os.environ.get("HERMES_SESSION_ID")
-    if not session_id:
-        return metadata
-    stamped = dict(metadata or {})
-    stamped["worker_session_id"] = session_id
-    return stamped
+    """Add trusted worker session id + token usage metadata for this worker."""
+    try:
+        from hermes_cli.project_usage_ledger import stamp_worker_usage_metadata
+        return stamp_worker_usage_metadata(task_id, metadata)
+    except Exception:
+        if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+            return metadata
+        session_id = os.environ.get("HERMES_SESSION_ID")
+        if not session_id:
+            return metadata
+        stamped = dict(metadata or {})
+        stamped["worker_session_id"] = session_id
+        return stamped
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -501,7 +505,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=task.status if task else None,
+                assignee=task.assignee if task else None,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -528,10 +538,12 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            metadata = _stamp_worker_session_metadata(tid, None)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
@@ -539,7 +551,13 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=task.status if task else None,
+                assignee=task.assignee if task else None,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -770,6 +788,57 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_merge_mutex(args: dict, **kw) -> str:
+    """Acquire/release/list per-repo merge locks for Review workers."""
+    action = str(args.get("action") or "acquire").strip().lower()
+    board = args.get("board")
+    repo = args.get("repo")
+    base_branch = args.get("base_branch") or "main"
+    task_id = _default_task_id(args.get("task_id"))
+    holder = args.get("holder") or os.environ.get("HERMES_SESSION_ID") or task_id
+    ttl = args.get("ttl_seconds")
+    if ttl is not None:
+        try:
+            ttl = int(ttl)
+        except (TypeError, ValueError):
+            return tool_error("ttl_seconds must be an integer")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if action == "list":
+                return json.dumps({"ok": True, "locks": kb.list_merge_mutexes(conn)})
+            if not repo:
+                return tool_error("repo is required for merge mutex acquire/release")
+            if action == "acquire":
+                return json.dumps({
+                    "ok": True,
+                    **kb.acquire_merge_mutex(
+                        conn,
+                        repo=repo,
+                        base_branch=base_branch,
+                        holder=holder,
+                        task_id=task_id,
+                        ttl_seconds=ttl,
+                    ),
+                })
+            if action == "release":
+                released = kb.release_merge_mutex(
+                    conn,
+                    repo=repo,
+                    base_branch=base_branch,
+                    holder=holder if holder else None,
+                )
+                return _ok(released=released)
+            return tool_error("action must be one of: acquire, release, list")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_merge_mutex: {e}")
+    except Exception as e:
+        logger.exception("kanban_merge_mutex failed")
+        return tool_error(f"kanban_merge_mutex: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -869,7 +938,11 @@ KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
         "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
+        "downstream workers and humans. On boards with the required Review "
+        "gate enabled, implementation-worker calls do not go straight to Done: "
+        "the kernel moves the card to Review and assigns the configured merge "
+        "captain, who is the only actor allowed to complete the card after "
+        "Bugbot/review and merge-train checks. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
@@ -1211,6 +1284,48 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_MERGE_MUTEX_SCHEMA = {
+    "name": "kanban_merge_mutex",
+    "description": (
+        "Acquire, release, or list the per-repo/base-branch merge mutex. "
+        "Review workers should acquire this immediately before the final PR "
+        "merge, then release after merge/rebase handoff. Multiple workers may "
+        "inspect, poll, and prepare in parallel; only the lock holder merges."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["acquire", "release", "list"],
+                "description": "Mutex operation. Defaults to acquire.",
+            },
+            "repo": {
+                "type": "string",
+                "description": "Repository key, usually owner/repo or an absolute repo path.",
+            },
+            "base_branch": {
+                "type": "string",
+                "description": "Target base branch for the merge train. Defaults to main.",
+            },
+            "holder": {
+                "type": "string",
+                "description": "Optional holder id. Defaults to session id or current task id.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task associated with the lock. Defaults to current worker task.",
+            },
+            "ttl_seconds": {
+                "type": "integer",
+                "description": "Optional lock TTL/renewal duration; defaults to kanban.merge_mutex_ttl_seconds.",
+            },
+            "board": _board_schema_prop(),
+        },
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1294,4 +1409,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_merge_mutex",
+    toolset="kanban",
+    schema=KANBAN_MERGE_MUTEX_SCHEMA,
+    handler=_handle_merge_mutex,
+    check_fn=_check_kanban_mode,
+    emoji="🚦",
 )

@@ -550,6 +550,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_promote = sub.add_parser(
+        "promote",
+        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+    )
+    p_promote.add_argument("task_id")
+    p_promote.add_argument(
+        "reason",
+        nargs="*",
+        help="Audit-trail reason (recorded on the task_events row)",
+    )
+    p_promote.add_argument(
+        "--ids",
+        nargs="+",
+        default=None,
+        help="Additional task ids to promote with the same reason (bulk mode)",
+    )
+    p_promote.add_argument(
+        "--force",
+        action="store_true",
+        help="Promote even if parent dependencies are not yet done/archived",
+    )
+    p_promote.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the promotion without mutating state",
+    )
+    p_promote.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -622,6 +655,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "stats", help="Per-status + per-assignee counts + oldest-ready age",
     )
     p_stats.add_argument("--json", action="store_true")
+
+    # --- usage ---
+    p_usage = sub.add_parser(
+        "usage", help="Show token/cost usage by board/task from the project usage ledger",
+    )
+    p_usage.add_argument("--task", dest="task_id", default=None, help="Drill down to a single task id")
+    p_usage_refresh = p_usage.add_mutually_exclusive_group()
+    p_usage_refresh.add_argument("--refresh", dest="refresh", action="store_true", default=None, help="Refresh the derived ledger before reading")
+    p_usage_refresh.add_argument("--no-refresh", dest="refresh", action="store_false", help="Read existing ledger rows without backfill")
+    p_usage.add_argument("--json", action="store_true")
 
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
@@ -899,12 +942,14 @@ def kanban_command(args: argparse.Namespace) -> int:
         "block":    _cmd_block,
         "schedule": _cmd_schedule,
         "unblock":  _cmd_unblock,
+        "promote":  _cmd_promote,
         "archive":  _cmd_archive,
         "tail":     _cmd_tail,
         "dispatch": _cmd_dispatch,
         "daemon":   _cmd_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
+        "usage":   _cmd_usage,
         "log":      _cmd_log,
         "runs":     _cmd_runs,
         "heartbeat": _cmd_heartbeat,
@@ -987,7 +1032,7 @@ def _board_task_counts(slug: str) -> dict[str, int]:
         path = kb.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        with kb.connect(board=slug) as conn:
+        with kb.connect_closing(board=slug) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
@@ -1230,7 +1275,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
@@ -1245,7 +1290,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
 
 
 def _cmd_assignees(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         data = kb.known_assignees(conn)
     if getattr(args, "json", False):
         print(json.dumps(data, indent=2, ensure_ascii=False))
@@ -1286,7 +1331,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
@@ -1335,7 +1380,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1361,7 +1406,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
@@ -1410,7 +1455,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -1576,7 +1621,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -1586,7 +1631,7 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.reclaim_task(
             conn, args.task_id,
             reason=getattr(args, "reason", None),
@@ -1603,7 +1648,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
@@ -1633,7 +1678,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     diag_config = kd.config_from_runtime_config(load_config())
 
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -1756,14 +1801,14 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     if not ok:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
@@ -1773,7 +1818,7 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
@@ -1804,7 +1849,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
@@ -1820,6 +1865,35 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _stamp_worker_usage_metadata(task_id: str, metadata: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Best-effort usage metadata stamping for worker terminal events.
+
+    Completing/blocking a Kanban task must remain reliable even if the optional
+    usage ledger path is unavailable or state.db is temporarily locked/corrupt.
+    The native kanban tools already treat usage stamping as best-effort; keep
+    the CLI path equally defensive.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return metadata
+    try:
+        from hermes_cli import project_usage_ledger
+        return project_usage_ledger.stamp_worker_usage_metadata(
+            task_id,
+            metadata,
+            on_error=lambda exc: print(
+                f"kanban: usage metadata unavailable: {exc}", file=sys.stderr
+            ),
+        )
+    except Exception as exc:
+        print(f"kanban: usage metadata unavailable: {exc}", file=sys.stderr)
+        session_id = os.environ.get("HERMES_SESSION_ID")
+        if not session_id:
+            return metadata
+        fallback = dict(metadata or {})
+        fallback["worker_session_id"] = str(session_id)
+        return fallback
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -1851,13 +1925,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     failed: list[str] = []
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         for tid in ids:
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
-                metadata=metadata,
+                metadata=_stamp_worker_usage_metadata(tid, metadata),
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
@@ -1878,7 +1952,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         if not kb.edit_completed_task_result(
             conn,
             args.task_id,
@@ -1900,7 +1974,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
@@ -1909,6 +1983,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                metadata=_stamp_worker_usage_metadata(tid, None),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
@@ -1922,7 +1997,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
@@ -1945,13 +2020,64 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     failed: list[str] = []
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         for tid in ids:
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}")
+    return 0 if not failed else 1
+
+
+def _cmd_promote(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    extra_ids = list(getattr(args, "ids", None) or [])
+    # Dedupe while preserving order; positional task_id always first.
+    ids: list[str] = []
+    seen: set[str] = set()
+    for tid in [args.task_id, *extra_ids]:
+        if tid not in seen:
+            ids.append(tid)
+            seen.add(tid)
+
+    results: list[dict[str, object]] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.promote_task(
+                conn,
+                tid,
+                actor=author,
+                reason=reason,
+                force=bool(args.force),
+                dry_run=bool(args.dry_run),
+            )
+            results.append({
+                "task_id": tid,
+                "promoted": ok,
+                "dry_run": bool(args.dry_run),
+                "forced": bool(args.force),
+                "reason": reason,
+                "error": err,
+            })
+
+    failed = [r for r in results if not r["promoted"]]
+    if as_json:
+        # Single-id stays a flat object for back-compat; bulk emits a list.
+        payload: object = results[0] if len(results) == 1 else results
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+
+    tag = " (dry)" if args.dry_run else ""
+    label = "Would promote" if args.dry_run else "Promoted"
+    for r in results:
+        if r["promoted"]:
+            suffix = f": {reason}" if reason else ""
+            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+        else:
+            print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
 
 
@@ -1965,7 +2091,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     failed: list[str] = []
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         if purge_ids:
             for tid in purge_ids:
                 if not kb.delete_archived_task(conn, tid):
@@ -1988,7 +2114,7 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
     try:
         while True:
-            with kb.connect() as conn:
+            with kb.connect_closing() as conn:
                 events = kb.list_events(conn, args.task_id)
             for e in events:
                 if e.id > last_id:
@@ -2002,7 +2128,7 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
@@ -2023,6 +2149,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "review_backlog_count": res.review_backlog_count,
+            "open_pr_count": res.open_pr_count,
+            "oldest_review_age_seconds": res.oldest_review_age_seconds,
+            "implementation_paused": res.implementation_paused,
+            "review_lane_used": res.review_lane_used,
+            "review_lane_reserved": res.review_lane_reserved,
+            "implementation_lane_used": res.implementation_lane_used,
+            "implementation_lane_capacity": res.implementation_lane_capacity,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2039,6 +2173,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    print(
+        f"Review queue: backlog={res.review_backlog_count} "
+        f"open_prs={res.open_pr_count} "
+        f"oldest_age={res.oldest_review_age_seconds if res.oldest_review_age_seconds is not None else '-'}s"
+    )
+    print(
+        f"Lanes:        review {res.review_lane_used}/{res.review_lane_reserved or '-'}  "
+        f"implementation {res.implementation_lane_used}/{res.implementation_lane_capacity if res.implementation_lane_capacity is not None else '-'}"
+    )
+    if res.implementation_paused:
+        print("Implementation paused: review/open-PR backlog above threshold")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
@@ -2172,7 +2317,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         from the dispatcher's perspective, not stuck.
         """
         try:
-            with kb.connect() as conn:
+            with kb.connect_closing() as conn:
                 return kb.has_spawnable_ready(conn)
         except Exception:
             return False
@@ -2203,7 +2348,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     cursor = 0
     print("Watching kanban events. Ctrl-C to stop.", flush=True)
     # Seed cursor at the latest id so we don't replay history.
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         row = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()
@@ -2211,7 +2356,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            with kb.connect() as conn:
+            with kb.connect_closing() as conn:
                 rows = conn.execute(
                     "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
                     "       t.assignee, t.tenant "
@@ -2243,8 +2388,70 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         return 0
 
 
+def _cmd_usage(args: argparse.Namespace) -> int:
+    from hermes_cli import project_usage_ledger as usage
+
+    refresh = bool(getattr(args, "refresh", False))
+    board = getattr(args, "board", None)
+    if board:
+        board = kb._normalize_board_slug(board)
+    data = usage.get_summary(
+        board=board,
+        task_id=getattr(args, "task_id", None),
+        refresh=refresh,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+
+    totals = data.get("totals") or {}
+    print("Project usage" + (f" for board {board}" if board else ""))
+    print(f"  ledger: {data.get('ledger_path')}")
+    if data.get("last_backfill_at"):
+        print(f"  refreshed: {_fmt_ts(int(data['last_backfill_at']))}")
+    if data.get("last_backfill_error"):
+        print(f"  warning: {data['last_backfill_error']}")
+    print(
+        "  total: "
+        f"{int(totals.get('input_tokens') or 0)} in / "
+        f"{int(totals.get('output_tokens') or 0)} out / "
+        f"{int(totals.get('reasoning_tokens') or 0)} reasoning / "
+        f"${float(totals.get('estimated_cost_usd') or 0):.4f} est"
+    )
+    print("\nBy board:")
+    for r in data.get("boards") or []:
+        print(
+            f"  {str(r.get('board_slug')):18s} "
+            f"tasks={int(r.get('tasks') or 0):4d} sessions={int(r.get('sessions') or 0):4d} "
+            f"tok={int(r.get('input_tokens') or 0) + int(r.get('output_tokens') or 0):8d} "
+            f"est=${float(r.get('estimated_cost_usd') or 0):.4f}"
+        )
+    tasks = data.get("tasks") or []
+    if tasks:
+        print("\nTop tasks:")
+        for r in tasks[:25]:
+            title = (r.get("task_title") or "")[:60]
+            print(
+                f"  {str(r.get('task_id')):14s} "
+                f"runs={int(r.get('runs') or 0):3d} "
+                f"tok={int(r.get('input_tokens') or 0) + int(r.get('output_tokens') or 0):8d} "
+                f"est=${float(r.get('estimated_cost_usd') or 0):.4f}  {title}"
+            )
+    runs = data.get("runs") or []
+    if runs:
+        print("\nRuns:")
+        for r in runs:
+            print(
+                f"  #{int(r.get('run_id') or 0):4d} {str(r.get('run_outcome') or r.get('run_status') or '-'):12s} "
+                f"session={str(r.get('session_id') or '-')[:20]:20s} "
+                f"tok={int(r.get('input_tokens') or 0) + int(r.get('output_tokens') or 0):8d} "
+                f"est=${float(r.get('estimated_cost_usd') or 0):.4f}"
+            )
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         stats = kb.board_stats(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
@@ -2260,11 +2467,30 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    pressure = stats.get("review_pressure") or {}
+    if pressure:
+        oldest = pressure.get("oldest_review_age_seconds")
+        print(
+            "\nReview pressure: "
+            f"backlog={pressure.get('review_backlog_count', 0)} "
+            f"review_cards={pressure.get('review_cards', 0)} "
+            f"open_prs={pressure.get('open_pr_count', 0)} "
+            f"oldest_review_age={str(int(oldest)) + 's' if oldest is not None else '-'}"
+        )
+    locks = stats.get("merge_locks") or []
+    if locks:
+        print("\nMerge locks:")
+        for lock in locks:
+            print(
+                f"  {lock.get('repo')}#{lock.get('base_branch')} "
+                f"holder={lock.get('holder')} task={lock.get('task_id') or '-'} "
+                f"expires_at={lock.get('expires_at')}"
+            )
     return 0
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
@@ -2281,7 +2507,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_list(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         subs = kb.list_notify_subs(conn, args.task_id)
     if getattr(args, "json", False):
         print(json.dumps(subs, indent=2, ensure_ascii=False))
@@ -2298,7 +2524,7 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.remove_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
@@ -2332,7 +2558,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         runs = kb.list_runs(conn, args.task_id, **rsk)
     if getattr(args, "json", False):
         print(json.dumps([
@@ -2371,7 +2597,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 
 def _cmd_context(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         text = kb.build_worker_context(conn, args.task_id)
     print(text)
     return 0
@@ -2537,7 +2763,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
         ).fetchall()
@@ -2560,7 +2786,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
         )

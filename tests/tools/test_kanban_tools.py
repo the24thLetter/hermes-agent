@@ -354,10 +354,9 @@ def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata == {
-            "files": 2,
-            "worker_session_id": "session-trusted",
-        }
+        assert run.metadata["files"] == 2
+        assert run.metadata["worker_session_id"] == "session-trusted"
+        assert run.metadata["usage_snapshot"]["session_id"] == "session-trusted"
     finally:
         conn.close()
 
@@ -387,6 +386,26 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
         }
     finally:
         conn.close()
+
+
+def test_stamp_worker_session_metadata_delegates_scope_check(monkeypatch):
+    """The usage ledger helper owns worker-task scope validation."""
+    from hermes_cli import project_usage_ledger
+    from tools import kanban_tools as kt
+
+    calls = []
+
+    def fake_stamp(task_id, metadata):
+        calls.append((task_id, metadata))
+        return metadata
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
+    monkeypatch.setattr(project_usage_ledger, "stamp_worker_usage_metadata", fake_stamp)
+
+    metadata = {"files": 2}
+    assert kt._stamp_worker_session_metadata("t-other", metadata) is metadata
+    assert calls == [("t-other", metadata)]
 
 
 def test_complete_with_result_only(worker_env):
@@ -1093,6 +1112,11 @@ def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
     from pathlib import Path as _P
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
     from run_agent import AIAgent
     a = AIAgent(
         api_key="test",
@@ -1115,6 +1139,11 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
     from pathlib import Path as _P
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
 
     from run_agent import AIAgent
     a = AIAgent(
@@ -1316,10 +1345,19 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     from hermes_cli import kanban_db as kb
     import hermes_cli.kanban_db as _kb
 
+    # detect_crashed_workers now gates each running task behind a
+    # launch-window grace period (c002668ff) so a freshly-spawned worker
+    # whose PID isn't yet visible on /proc isn't reclaimed. The fixture
+    # creates the task moments before this assertion, so the grace
+    # period (default 30s) would skip the liveness check. Zero it out
+    # for this test — we WANT immediate reclamation here.
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
     conn = kb.connect()
     try:
         run1 = kb.latest_run(conn, worker_env)
         kb._set_worker_pid(conn, worker_env, 98765)
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [worker_env]
 

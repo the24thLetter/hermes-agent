@@ -186,6 +186,126 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
     }
 
 
+def _usage_from_run_snapshots(board_slug: Optional[str], task_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Build per-task card usage from task_run metadata snapshots.
+
+    Worker terminal events stamp a usage_snapshot when they complete/block.
+    Reading those rows is board-local and cheap, so card badges can update for
+    newly completed tasks without running a full cross-board project ledger
+    backfill on every board poll.
+    """
+    if not task_ids:
+        return {}
+    wanted = set(task_ids)
+    placeholders = ", ".join(["?"] * len(task_ids))
+    latest_by_task: dict[str, dict[str, Any]] = {}
+    try:
+        conn = kanban_db.connect(board=board_slug)
+    except Exception as exc:
+        log.debug("kanban usage snapshot lookup unavailable: %s", exc)
+        return {}
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT task_id, metadata
+            FROM task_runs
+            WHERE task_id IN ({placeholders})
+            ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+            """,
+            list(task_ids),
+        ).fetchall()
+    except Exception as exc:
+        log.debug("kanban usage snapshot lookup failed: %s", exc)
+        return {}
+    finally:
+        conn.close()
+    for row in rows:
+        tid = str(row["task_id"])
+        if tid not in wanted:
+            continue
+        bucket = latest_by_task.setdefault(tid, {
+            "runs": 0,
+            "by_session": {},
+            "sessionless": None,
+        })
+        bucket["runs"] += 1
+        try:
+            meta = json.loads(row["metadata"] or "{}")
+        except Exception:
+            continue
+        snapshot = meta.get("usage_snapshot") if isinstance(meta, dict) else None
+        if not isinstance(snapshot, dict):
+            continue
+        sid = snapshot.get("session_id") or meta.get("worker_session_id")
+        if sid:
+            # Rows are newest-first, so the first snapshot per session is the
+            # safest board-local estimate for that cumulative session total.
+            bucket["by_session"].setdefault(str(sid), snapshot)
+        elif bucket["sessionless"] is None:
+            bucket["sessionless"] = snapshot
+
+    out: dict[str, dict[str, Any]] = {}
+    for tid, bucket in latest_by_task.items():
+        by_session = bucket["by_session"]
+        if len(by_session) > 1:
+            # usage_snapshot values are cumulative per session, not per-run
+            # deltas. Summing multiple sessions can charge unrelated work from
+            # reused agent sessions to this card, so let _usage_by_task fall
+            # back to the project ledger, which correlates each session once.
+            continue
+        if by_session:
+            snapshot = next(iter(by_session.values()))
+            sessions = 1
+        else:
+            snapshot = bucket["sessionless"]
+            sessions = 1 if snapshot is not None else 0
+        if not isinstance(snapshot, dict):
+            continue
+        out[tid] = {
+            "runs": int(bucket["runs"]),
+            "sessions": sessions,
+            "input_tokens": int(snapshot.get("input_tokens") or 0),
+            "output_tokens": int(snapshot.get("output_tokens") or 0),
+            "reasoning_tokens": int(snapshot.get("reasoning_tokens") or 0),
+            "estimated_cost_usd": float(snapshot.get("estimated_cost_usd") or 0.0),
+            "actual_cost_usd": float(snapshot.get("actual_cost_usd") or 0.0),
+        }
+    return out
+
+
+def _usage_by_task(board_slug: Optional[str], task_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not task_ids:
+        return {}
+    out = _usage_from_run_snapshots(board_slug, task_ids)
+    missing = [tid for tid in task_ids if tid not in out]
+    if not missing:
+        return out
+    try:
+        from hermes_cli import project_usage_ledger as usage
+        rows = usage.get_task_rollups(board=board_slug, task_ids=missing, refresh=False)
+        if not rows:
+            summary = usage.get_summary(board=board_slug, refresh=False)
+            if summary.get("last_backfill_at") is None:
+                rows = usage.get_task_rollups(board=board_slug, task_ids=missing, refresh=True)
+    except Exception as exc:
+        log.debug("kanban usage rollup unavailable: %s", exc)
+        return out
+    wanted = set(missing)
+    for row in rows:
+        tid = row.get("task_id")
+        if tid in wanted:
+            out[str(tid)] = {
+                "runs": row.get("runs", 0),
+                "sessions": row.get("sessions", 0),
+                "input_tokens": row.get("input_tokens", 0),
+                "output_tokens": row.get("output_tokens", 0),
+                "reasoning_tokens": row.get("reasoning_tokens", 0),
+                "estimated_cost_usd": row.get("estimated_cost_usd", 0.0),
+                "actual_cost_usd": row.get("actual_cost_usd", 0.0),
+            }
+    return out
+
+
 def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     """Serialise a Run for the drawer's Run history section."""
     return {
@@ -431,7 +551,9 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        usage_map = _usage_by_task(board or kanban_db.get_current_board(), task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -442,6 +564,10 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            d["usage"] = usage_map.get(t.id, {
+                "runs": 0, "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "reasoning_tokens": 0, "estimated_cost_usd": 0.0, "actual_cost_usd": 0.0,
+            })
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
