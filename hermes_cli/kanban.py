@@ -2467,6 +2467,25 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    pressure = stats.get("review_pressure") or {}
+    if pressure:
+        oldest = pressure.get("oldest_review_age_seconds")
+        print(
+            "\nReview pressure: "
+            f"backlog={pressure.get('review_backlog_count', 0)} "
+            f"review_cards={pressure.get('review_cards', 0)} "
+            f"open_prs={pressure.get('open_pr_count', 0)} "
+            f"oldest_review_age={str(int(oldest)) + 's' if oldest is not None else '-'}"
+        )
+    locks = stats.get("merge_locks") or []
+    if locks:
+        print("\nMerge locks:")
+        for lock in locks:
+            print(
+                f"  {lock.get('repo')}#{lock.get('base_branch')} "
+                f"holder={lock.get('holder')} task={lock.get('task_id') or '-'} "
+                f"expires_at={lock.get('expires_at')}"
+            )
     return 0
 
 
