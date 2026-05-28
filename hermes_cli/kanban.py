@@ -2207,6 +2207,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "review_backlog_count": res.review_backlog_count,
+            "open_pr_count": res.open_pr_count,
+            "oldest_review_age_seconds": res.oldest_review_age_seconds,
+            "implementation_paused": res.implementation_paused,
+            "review_lane_used": res.review_lane_used,
+            "review_lane_reserved": res.review_lane_reserved,
+            "implementation_lane_used": res.implementation_lane_used,
+            "implementation_lane_capacity": res.implementation_lane_capacity,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2223,6 +2231,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    print(
+        f"Review queue: backlog={res.review_backlog_count} "
+        f"open_prs={res.open_pr_count} "
+        f"oldest_age={res.oldest_review_age_seconds if res.oldest_review_age_seconds is not None else '-'}s"
+    )
+    print(
+        f"Lanes:        review {res.review_lane_used}/{res.review_lane_reserved or '-'}  "
+        f"implementation {res.implementation_lane_used}/{res.implementation_lane_capacity if res.implementation_lane_capacity is not None else '-'}"
+    )
+    if res.implementation_paused:
+        print("Implementation paused: review/open-PR backlog above threshold")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
