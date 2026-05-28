@@ -1031,6 +1031,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Per-repo/default-branch merge mutex used by merge-captain Review workers.
+-- Workers may review/rebase/poll in parallel, but must acquire this lock
+-- before the final merge into a shared base branch.
+CREATE TABLE IF NOT EXISTS kanban_merge_locks (
+    repo         TEXT NOT NULL,
+    base_branch  TEXT NOT NULL DEFAULT 'main',
+    holder       TEXT NOT NULL,
+    task_id      TEXT,
+    acquired_at  INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    PRIMARY KEY (repo, base_branch)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -6154,12 +6167,6 @@ def dispatch_once(
     if total_capacity is not None and total_capacity < 1:
         return result
 
-    running_total = int(
-        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
-    )
-    if total_capacity is not None and running_total >= total_capacity:
-        return result
-
     pressure = review_pressure_counts(conn, board=board)
     review_backlog = int(pressure["review_backlog_count"])
     result.review_backlog_count = review_backlog
@@ -6168,6 +6175,20 @@ def dispatch_once(
     reserved_review_slots = _resolve_review_reserved_slots(total_capacity, board=board)
     lane_reservations_active = total_capacity is not None and reserved_review_slots > 0
     review_running = _running_review_count(conn) if lane_reservations_active else 0
+    result.review_lane_used = review_running
+    result.review_lane_reserved = reserved_review_slots
+
+    running_total = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    if total_capacity is not None and running_total >= total_capacity:
+        result.implementation_lane_used = max(0, running_total - review_running)
+        result.implementation_lane_capacity = (
+            max(0, total_capacity - reserved_review_slots)
+            if lane_reservations_active else total_capacity
+        )
+        return result
+
     implementation_running = max(0, running_total - review_running)
     implementation_paused = _implementation_pause_state(
         review_backlog,
@@ -6197,6 +6218,8 @@ def dispatch_once(
         implementation_remaining = max(0, implementation_lane_cap - implementation_running)
         if implementation_paused:
             implementation_remaining = 0
+        result.implementation_lane_used = implementation_running
+        result.implementation_lane_capacity = implementation_lane_cap
     else:
         remaining_total = (
             max(0, total_capacity - running_total)
@@ -6204,6 +6227,8 @@ def dispatch_once(
         )
         review_remaining = remaining_total
         implementation_remaining = 0 if implementation_paused else remaining_total
+        result.implementation_lane_used = running_total
+        result.implementation_lane_capacity = total_capacity
 
     spawned = 0
 
@@ -7218,8 +7243,109 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "review_pressure": review_pressure_counts(conn),
+        "merge_locks": list_merge_mutexes(conn),
         "now": now,
     }
+
+
+def _normalize_merge_lock_key(repo: str, base_branch: Optional[str]) -> tuple[str, str]:
+    repo_key = (repo or "").strip()
+    base_key = (base_branch or "main").strip() or "main"
+    if not repo_key:
+        raise ValueError("repo is required for a merge mutex")
+    return repo_key, base_key
+
+
+def _purge_expired_merge_mutexes(conn: sqlite3.Connection, *, now: Optional[int] = None) -> None:
+    now = int(time.time()) if now is None else int(now)
+    conn.execute("DELETE FROM kanban_merge_locks WHERE expires_at <= ?", (now,))
+
+
+def acquire_merge_mutex(
+    conn: sqlite3.Connection,
+    *,
+    repo: str,
+    base_branch: str = "main",
+    holder: str,
+    task_id: Optional[str] = None,
+    ttl_seconds: Optional[int] = None,
+) -> dict[str, Any]:
+    """Acquire or renew the per-repo/base merge mutex.
+
+    Returns ``{"acquired": True, ...}`` when the caller owns the mutex and
+    ``{"acquired": False, "lock": ...}`` when another live holder owns it.
+    A holder may renew its own lock. Expired locks are reclaimed atomically.
+    """
+    repo_key, base_key = _normalize_merge_lock_key(repo, base_branch)
+    holder_key = (holder or "").strip()
+    if not holder_key:
+        raise ValueError("holder is required for a merge mutex")
+    ttl = ttl_seconds or _kanban_int_config("merge_mutex_ttl_seconds", 1800, minimum=1) or 1800
+    now = int(time.time())
+    expires = now + int(ttl)
+    with write_txn(conn):
+        _purge_expired_merge_mutexes(conn, now=now)
+        existing = conn.execute(
+            "SELECT * FROM kanban_merge_locks WHERE repo = ? AND base_branch = ?",
+            (repo_key, base_key),
+        ).fetchone()
+        if existing and existing["holder"] != holder_key:
+            return {
+                "acquired": False,
+                "lock": dict(existing),
+                "now": now,
+            }
+        conn.execute(
+            """
+            INSERT INTO kanban_merge_locks
+                (repo, base_branch, holder, task_id, acquired_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(repo, base_branch) DO UPDATE SET
+                holder = excluded.holder,
+                task_id = excluded.task_id,
+                expires_at = excluded.expires_at
+            """,
+            (repo_key, base_key, holder_key, task_id, now, expires),
+        )
+        lock = conn.execute(
+            "SELECT * FROM kanban_merge_locks WHERE repo = ? AND base_branch = ?",
+            (repo_key, base_key),
+        ).fetchone()
+    return {"acquired": True, "lock": dict(lock), "now": now}
+
+
+def release_merge_mutex(
+    conn: sqlite3.Connection,
+    *,
+    repo: str,
+    base_branch: str = "main",
+    holder: Optional[str] = None,
+) -> bool:
+    """Release a merge mutex. If ``holder`` is provided it must match."""
+    repo_key, base_key = _normalize_merge_lock_key(repo, base_branch)
+    with write_txn(conn):
+        if holder:
+            cur = conn.execute(
+                "DELETE FROM kanban_merge_locks WHERE repo = ? AND base_branch = ? AND holder = ?",
+                (repo_key, base_key, holder),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM kanban_merge_locks WHERE repo = ? AND base_branch = ?",
+                (repo_key, base_key),
+            )
+    return cur.rowcount > 0
+
+
+def list_merge_mutexes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    now = int(time.time())
+    with write_txn(conn):
+        _purge_expired_merge_mutexes(conn, now=now)
+    rows = conn.execute(
+        "SELECT * FROM kanban_merge_locks ORDER BY repo, base_branch"
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _to_epoch(val) -> Optional[int]:
