@@ -261,7 +261,7 @@ jobs:
   # This is a registry-side operation — no building, no layer re-push —
   # so it runs in ~30 seconds.
   #
-  # On main pushes: tags both :main and :latest.
+  # On main pushes: tags :main only.
   # On releases: always tags :<release_tag_name>; also tags :latest only when
   # the release commit is current with origin/main, so backport releases cannot
   # drag :latest backwards.
@@ -316,7 +316,6 @@ jobs:
           else
             docker buildx imagetools create \
               -t "${IMAGE_NAME}:main" \
-              -t "${IMAGE_NAME}:latest" \
               "${args[@]}"
           fi
         env:
