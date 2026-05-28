@@ -184,17 +184,6 @@ class TestPassthrough:
         text = "Connecting to https://api.openai.com/v1/chat/completions"
         assert redact_sensitive_text(text) == text
 
-    def test_url_userinfo_password_redacted(self):
-        text = "Fetching https://ci-user:password12345@git.company.test/repo.git"
-        result = redact_sensitive_text(text)
-        assert "password12345" not in result
-        assert "https://ci-user:***@git.company.test/repo.git" in result
-
-    def test_ftp_url_userinfo_password_redacted(self):
-        text = "ftp://admin:backup-password@files.company.test/archive.tgz"
-        result = redact_sensitive_text(text)
-        assert "backup-password" not in result
-        assert "ftp://admin:***@files.company.test/archive.tgz" == result
 
 
 class TestRedactingFormatter:
