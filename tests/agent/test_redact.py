@@ -380,11 +380,11 @@ class TestDiscordMentions:
 
 
 class TestWebUrlsNotRedacted:
-    """Web URLs (http/https/wss) pass through unchanged — magic-link
+    """Web URL query strings pass through unchanged — magic-link
     checkouts, OAuth callbacks the agent is meant to follow, and pre-signed
     share URLs must reach the tool intact. Known credential shapes inside
     URLs (sk-, ghp_, JWTs) are still caught by the prefix and JWT regexes.
-    DB connection-string passwords are still caught by _DB_CONNSTR_RE.
+    URL userinfo and DB connection-string passwords are still redacted.
     """
 
     def test_oauth_callback_code_passes_through(self):
@@ -403,9 +403,17 @@ class TestWebUrlsNotRedacted:
         text = "https://s3.amazonaws.com/bucket/k?signature=LONG_PRESIGNED_SIG&id=public"
         assert redact_sensitive_text(text) == text
 
-    def test_https_userinfo_passes_through(self):
-        text = "URL: https://user:supersecretpw@host.example.com/path"
-        assert redact_sensitive_text(text) == text
+    def test_https_userinfo_password_redacted(self):
+        text = "URL: https://user:password12345@host.example.com/path"
+        result = redact_sensitive_text(text)
+        assert "password12345" not in result
+        assert "https://user:***@host.example.com/path" in result
+
+    def test_ftp_url_userinfo_password_redacted(self):
+        text = "URL: ftp://backup:backup-password@host.example.com/archive"
+        result = redact_sensitive_text(text)
+        assert "backup-password" not in result
+        assert "ftp://backup:***@host.example.com/archive" in result
 
     def test_websocket_url_query_passes_through(self):
         text = "wss://api.example.com/ws?token=opaqueWsToken123"
