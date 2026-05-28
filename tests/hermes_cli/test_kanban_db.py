@@ -3168,6 +3168,149 @@ def test_dispatch_blocks_stale_worktree_branch_with_rebase_guidance(
     assert "rebase" in (run.summary or "").lower()
 
 
+def test_dispatch_backpressure_hysteresis_keeps_paused_until_resume_threshold(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb,
+        "_kanban_config",
+        lambda board=None: _lane_config(review_backlog_resume_threshold=3),
+    )
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        ready = [kb.create_task(conn, title=f"ready {i}", assignee="alice") for i in range(5)]
+        review = [kb.create_task(conn, title=f"review {i}", assignee="mergecaptain") for i in range(7)]
+        for tid in review:
+            _set_task_status(conn, tid, "review")
+
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+        assert first.implementation_paused is True
+        assert spawned == review[:4]
+
+        # Drain to backlog=4. Because the board is already paused and resume=3,
+        # implementation must remain paused and only Review work can claim.
+        for tid in review[:3]:
+            _set_task_status(conn, tid, "done")
+        spawned.clear()
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+        assert second.review_backlog_count == 4
+        assert second.implementation_paused is True
+        assert spawned == review[4:]
+
+        # Drain one more review-origin run to backlog=3, meeting the resume
+        # threshold. Ready implementation can claim again.
+        _set_task_status(conn, review[3], "done")
+        spawned.clear()
+        third = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=8, max_in_progress=8)
+        assert third.review_backlog_count == 3
+        assert third.implementation_paused is False
+        assert spawned == ready[:4]
+
+
+def test_review_pressure_counts_active_prs_and_board_stats_surface_queue_pressure(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        active_pr = kb.create_task(conn, title="active pr", assignee="alice")
+        blocked_pr = kb.create_task(conn, title="blocked pr", assignee="alice")
+        done_pr = kb.create_task(conn, title="done pr", assignee="alice")
+        kb.block_task(conn, blocked_pr, reason="needs rebase")
+        kb.add_comment(conn, active_pr, "bot", "PR https://github.com/acme/app/pull/10")
+        kb.add_comment(conn, blocked_pr, "bot", "PR https://github.com/acme/app/pull/11")
+        kb.add_comment(conn, done_pr, "bot", "PR https://github.com/acme/app/pull/12")
+        kb.complete_task(conn, done_pr)
+        pressure = kb.review_pressure_counts(conn)
+        stats = kb.board_stats(conn)
+
+    assert pressure["active_pr_task_count"] == 2
+    assert pressure["open_pr_count"] == 2
+    assert pressure["review_backlog_count"] == 2
+    assert active_pr in pressure["task_ids"]
+    assert blocked_pr in pressure["task_ids"]
+    assert done_pr not in pressure["task_ids"]
+    assert stats["review_pressure"]["open_pr_count"] == 2
+
+
+def test_dispatch_honors_per_board_lane_overrides(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    board = "board-overrides"
+    kb.create_board(board)
+    meta = kb.read_board_metadata(board)
+    meta["kanban"] = {
+        "max_spawn": 4,
+        "max_in_progress": 4,
+        "review_reserved_slots": 2,
+        "review_backlog_pause_threshold": 99,
+    }
+    meta.pop("db_path", None)
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 42
+
+    with kb.connect(board=board) as conn:
+        ready = [kb.create_task(conn, title=f"ready {i}", assignee="alice", board=board) for i in range(5)]
+        review = [kb.create_task(conn, title=f"review {i}", assignee="mergecaptain", board=board) for i in range(3)]
+        for tid in review:
+            _set_task_status(conn, tid, "review")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=99, max_in_progress=99, board=board)
+
+    assert res.review_lane_reserved == 2
+    assert res.implementation_lane_capacity == 2
+    assert spawned == [*review[:2], *ready[:2]]
+
+
+def test_merge_mutex_excludes_same_repo_base_until_released_or_expired(kanban_home):
+    with kb.connect() as conn:
+        first = kb.acquire_merge_mutex(
+            conn, repo="acme/app", base_branch="main", holder="worker-a", task_id="t_a", ttl_seconds=60,
+        )
+        second = kb.acquire_merge_mutex(
+            conn, repo="acme/app", base_branch="main", holder="worker-b", task_id="t_b", ttl_seconds=60,
+        )
+        other_branch = kb.acquire_merge_mutex(
+            conn, repo="acme/app", base_branch="release", holder="worker-b", task_id="t_b", ttl_seconds=60,
+        )
+        released_wrong_holder = kb.release_merge_mutex(
+            conn, repo="acme/app", base_branch="main", holder="worker-b",
+        )
+        released = kb.release_merge_mutex(
+            conn, repo="acme/app", base_branch="main", holder="worker-a",
+        )
+        third = kb.acquire_merge_mutex(
+            conn, repo="acme/app", base_branch="main", holder="worker-b", task_id="t_b", ttl_seconds=60,
+        )
+        expired = kb.acquire_merge_mutex(
+            conn, repo="acme/other", base_branch="main", holder="old", task_id="t_old", ttl_seconds=1,
+        )
+        conn.execute(
+            "UPDATE kanban_merge_locks SET expires_at = ? WHERE repo = ?",
+            (int(time.time()) - 1, "acme/other"),
+        )
+        reclaimed = kb.acquire_merge_mutex(
+            conn, repo="acme/other", base_branch="main", holder="new", task_id="t_new", ttl_seconds=60,
+        )
+
+    assert first["acquired"] is True
+    assert second["acquired"] is False
+    assert second["lock"]["holder"] == "worker-a"
+    assert other_branch["acquired"] is True
+    assert released_wrong_holder is False
+    assert released is True
+    assert third["acquired"] is True
+    assert expired["acquired"] is True
+    assert reclaimed["acquired"] is True
+    assert reclaimed["lock"]["holder"] == "new"
+
+
 # Review column dispatch
 # ---------------------------------------------------------------------------
 
