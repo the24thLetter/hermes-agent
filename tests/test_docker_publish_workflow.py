@@ -29,5 +29,7 @@ def test_release_latest_update_is_guarded_by_current_registry_latest_revision() 
     assert '-t "${IMAGE_NAME}:${TAG}"' in release_branch
     assert '-t "${IMAGE_NAME}:latest"' in release_branch
     assert 'docker buildx imagetools inspect "${IMAGE_NAME}:latest"' in release_branch
+    assert 'data.get("Image") or data.get("image")' in release_branch
+    assert 'image.get("Labels") or image.get("labels")' in release_branch
     assert "org.opencontainers.image.revision" in release_branch
     assert 'merge-base --is-ancestor "$latest_revision" "$tag_commit"' in release_branch

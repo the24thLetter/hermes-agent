@@ -347,7 +347,7 @@ jobs:
             tag_commit="$(git -C "$GITHUB_WORKSPACE" rev-parse "${TAG}^{commit}")"
             latest_revision=""
             if latest_metadata="$(docker buildx imagetools inspect "${IMAGE_NAME}:latest" --format '{{json .}}' 2>/dev/null)"; then
-              latest_revision="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print((data.get("image") or {}).get("labels", {}).get("org.opencontainers.image.revision", ""))' <<<"$latest_metadata")"
+              latest_revision="$(python3 -c 'import json,sys; data=json.load(sys.stdin); image=data.get("Image") or data.get("image") or {}; labels=image.get("Labels") or image.get("labels") or {}; print(labels.get("org.opencontainers.image.revision", ""))' <<<"$latest_metadata")"
             fi
             if [ -n "$latest_revision" ] && git -C "$GITHUB_WORKSPACE" cat-file -e "$latest_revision^{commit}" 2>/dev/null && git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$latest_revision" "$tag_commit"; then
               tags+=(-t "${IMAGE_NAME}:latest")
