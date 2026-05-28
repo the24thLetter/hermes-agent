@@ -653,16 +653,51 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
+| `kanban.max_spawn` | unset (unlimited) | Live dispatcher concurrency cap. Counts already-running workers plus this tick's claims; use with `max_in_progress` to keep total project worker concurrency bounded. |
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+| `kanban.review_reserved_slots` / `kanban.review_reserved_ratio` | unset | Protects Review-column capacity from implementation work. With `max_spawn: 8`, `max_in_progress: 8`, and `review_reserved_slots: 4` (or ratio `0.5`), Review-origin runs may occupy four reserved slots while new Ready/implementation claims are capped to the remaining four. Review lane accounting uses task status / current run origin, not assignee name, so merge-captain maintenance cards that start from Ready do not consume protected Review capacity. |
+| `kanban.review_allow_implementation_borrow` | `false` | If `true`, implementation may borrow otherwise-idle Review slots only while no Review backlog exists. The default leaves the reservation empty so a Review card arriving on the next tick is not starved behind a full board of implementation workers. |
+| `kanban.review_backlog_pause_threshold` | unset | When Review/open-PR pressure is greater than this value, the dispatcher pauses new non-review implementation claims for that board while continuing to claim Review work. |
+| `kanban.review_backlog_resume_threshold` | unset | Hysteresis threshold for resuming implementation after a pause. If unset, defaults to `pause_threshold - 3` (floored at 0) so implementation does not flap on/off around the pause threshold. |
+| `kanban.review_backlog_include_prs` | `true` | Adds PR-backed active cards to Review pressure: Review cards, Review-origin running cards, and active/blocked/ready cards with GitHub PR URLs in comments/events/runs. This is local board state, not a live GitHub API call. |
+| `kanban.merge_mutex_enabled` / `kanban.merge_mutex_ttl_seconds` | `true` / `1800` | Enables a per-repo/base-branch merge mutex surfaced through `kanban_merge_mutex` and `kanban stats`. Multiple merge-captain workers may inspect, rebase, poll checks, and update PR bodies in parallel; only the lock holder should perform the final merge into a repo/base branch. |
+| `kanban.implementation_base_branch` | `main` | Fresh-base guard for repo-backed `worktree` implementation cards. Before dispatching a new implementation run, the dispatcher fetches `origin/<branch>`, creates missing implementation branches from that ref, and blocks stale existing branches with exact rebase guidance instead of silently continuing from old base state. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
-  max_in_progress: 2
+  max_spawn: 8
+  max_in_progress: 8
+  require_review_before_done: true
+  merge_captain_profile: mergecaptain
+  review_agent_skills:
+    - github/cursor-bugbot-sweep
+    - github/github-pr-workflow
+  review_reserved_slots: 4      # or review_reserved_ratio: 0.5
+  review_backlog_pause_threshold: 6
+  review_backlog_resume_threshold: 3
+  review_backlog_include_prs: true
+  review_allow_implementation_borrow: false
+  merge_mutex_enabled: true
+  merge_mutex_ttl_seconds: 1800
+  implementation_base_branch: main
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+These settings are read by the gateway-embedded dispatcher at tick time from
+configuration and board metadata. Restart the gateway after upgrading code or
+changing process supervision; ordinary config value changes are picked up by the
+next dispatcher process/tick in normal installs, but a restart is the safe
+activation path for LaunchDaemon-managed gateways.
+
+Recommended SuperOptions operating values are the example above: total worker
+capacity 8, Review reserved slots 4, implementation pause when Review/open-PR
+pressure is greater than 6, resume at 3, `mergecaptain` as the Review owner,
+and the Cursor/Bugbot + GitHub PR workflow skills loaded for Review workers.
+Use per-board metadata overrides when another board needs lower concurrency or
+different thresholds than the global `kanban:` defaults.
 
 ### Scheduled task starts (`scheduled_at`)
 
