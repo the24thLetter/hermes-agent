@@ -218,10 +218,10 @@ class TestConfig:
         p = provider_with_config(recall_types="observation, world")
         assert p._recall_types == ["observation", "world"]
 
-    def test_recall_types_empty_list_falls_back_to_default(self, provider_with_config):
-        """An empty list shouldn't disable the filter (would be wider than default)."""
+    def test_recall_types_empty_list_disables_filter(self, provider_with_config):
+        """An explicit empty list preserves the legacy all-types recall behavior."""
         p = provider_with_config(recall_types=[])
-        assert p._recall_types == ["observation"]
+        assert p._recall_types == []
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -662,6 +662,15 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_queue_prefetch_omits_types_when_recall_types_empty(self, provider_with_config):
+        p = provider_with_config(recall_types=[])
+        p.queue_prefetch("test query")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert "types" not in call_kwargs
 
 
 # ---------------------------------------------------------------------------

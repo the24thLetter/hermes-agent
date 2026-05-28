@@ -119,7 +119,6 @@ class TestContextOverflowLimitSelection:
 
     def test_generic_overflow_without_provider_limit_keeps_context_length(self):
         from agent.model_metadata import get_context_length_from_provider_error
-        from agent.model_metadata import get_next_probe_tier
         from agent.model_metadata import parse_context_limit_from_error
 
         old_ctx = 1_000_000
@@ -129,7 +128,6 @@ class TestContextOverflowLimitSelection:
         )
 
         assert parse_context_limit_from_error(error_msg) is None
-        assert get_next_probe_tier(old_ctx) == 256_000
         assert get_context_length_from_provider_error(error_msg, old_ctx) is None
 
     def test_explicit_provider_limit_still_selects_that_limit(self):
@@ -307,7 +305,6 @@ class TestContextNotHalvedOnOutputCapError:
         """On 'max_tokens too large' error, _ephemeral_max_output_tokens is set
         and compressor.context_length is left unchanged."""
         from agent.model_metadata import parse_available_output_tokens_from_error
-        from agent.model_metadata import get_next_probe_tier
 
         error_msg = (
             "max_tokens: 128000 > context_window: 200000 "

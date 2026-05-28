@@ -877,14 +877,6 @@ def _invalidate_cached_context_length(model: str, base_url: str) -> None:
         logger.debug("Failed to invalidate context length cache entry %s: %s", key, e)
 
 
-def get_next_probe_tier(current_length: int) -> Optional[int]:
-    """Return the next lower probe tier, or None if already at minimum."""
-    for tier in CONTEXT_PROBE_TIERS:
-        if tier < current_length:
-            return tier
-    return None
-
-
 def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
     """Try to extract the actual context limit from an API error message.
 
