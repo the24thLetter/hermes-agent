@@ -7076,7 +7076,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
             lines.append(
                 "Only call kanban_complete after the PR is clean, up to date, merged, and the "
-                "task is truly done."
+                "task is truly done. A Cursor/Bugbot check-run or review that says "
+                "'previously reported issue(s) remain unresolved' is not clean even when "
+                "it also reports no new issues or issueCount=0; inspect and fix or explicitly "
+                "disposition those prior findings before merge."
             )
             lines.append("")
         else:
