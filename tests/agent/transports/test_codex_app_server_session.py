@@ -308,8 +308,8 @@ class TestRunTurn:
         """When codex stderr has content (non-OAuth), the tail gets attached
         to the user-facing error so config/provider problems are debuggable
         instead of just 'Internal error'. Credential-shaped values in stderr
-        are redacted via agent.redact(force=True); web-URL query params pass
-        through (see fix(redact): pass web URLs through unchanged)."""
+        are redacted via agent.redact(force=True); force-redaction also
+        redacts sensitive web-URL query params in user-facing errors."""
         client = FakeClient()
         client.set_stderr_tail([
             "ERROR: provider auth failed",
@@ -334,6 +334,7 @@ class TestRunTurn:
         assert "provider auth failed" in r.error
         # Credential-shaped values still redacted (sk- prefix + Bearer header)
         assert "sk-live-deadbeefdeadbeef" not in r.error
+        assert "querysecret12345" not in r.error
         # Non-OAuth → should NOT retire (subprocess JSON-RPC is still healthy).
         assert r.should_retire is False
 

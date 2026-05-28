@@ -162,6 +162,20 @@ _URL_USERINFO_RE = re.compile(
     re.IGNORECASE,
 )
 
+# URL/query redaction is intentionally limited to force=True call sites. Normal
+# logging preserves navigable magic links, OAuth callbacks, and pre-signed URLs;
+# force=True is used at safety boundaries (e.g. user-facing error tails) where
+# raw opaque tokens must not leak even if the operator globally disabled
+# redaction or the URL would otherwise remain clickable.
+_WEB_URL_QUERY_RE = re.compile(
+    r"((?:https?|wss?)://[^\s\"'<>?#]+\?)([^\s\"'<>#]+)",
+    re.IGNORECASE,
+)
+_HTTP_REQUEST_TARGET_QUERY_RE = re.compile(
+    r"((?:^|[\s\"'])(?:/[^\s\"'?]+\?))([^\s\"']+)",
+    re.IGNORECASE,
+)
+
 # Form-urlencoded body detection: conservative — only applies when the entire
 # text looks like a query string (k=v&k=v pattern with no newlines).
 _FORM_BODY_RE = re.compile(
@@ -272,6 +286,20 @@ def _redact_url_userinfo(text: str) -> str:
     return _URL_USERINFO_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
 
 
+def _redact_url_query_params(text: str) -> str:
+    """Redact sensitive query params in full web URLs."""
+    return _WEB_URL_QUERY_RE.sub(
+        lambda m: f"{m.group(1)}{_redact_query_string(m.group(2))}", text
+    )
+
+
+def _redact_http_request_target_query_params(text: str) -> str:
+    """Redact sensitive query params in HTTP access-log request targets."""
+    return _HTTP_REQUEST_TARGET_QUERY_RE.sub(
+        lambda m: f"{m.group(1)}{_redact_query_string(m.group(2))}", text
+    )
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -283,7 +311,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
     constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
-    private keys, DB connstrings, JWTs, and URL secrets are still redacted.
+    private keys, DB connstrings, JWTs, and URL userinfo are still redacted.
 
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
@@ -353,13 +381,18 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
 
     # NOTE: Web-URL query-param and HTTP access-log request-target redaction is
-    # intentionally OFF. Many legitimate workflows pass opaque tokens through
-    # query strings — magic-link checkouts, OAuth callbacks the agent is meant
-    # to follow, pre-signed share URLs — and blanket-redacting param values by
-    # name breaks those skills mid-flow. URL userinfo passwords remain redacted.
+    # intentionally OFF for normal logging. Many legitimate workflows pass
+    # opaque tokens through query strings — magic-link checkouts, OAuth
+    # callbacks the agent is meant to follow, pre-signed share URLs — and
+    # blanket-redacting param values by name breaks those skills mid-flow.
+    # force=True is the safety-boundary exception: callers such as user-facing
+    # error tails must never return raw opaque query tokens.
     # Known credential shapes (sk-, ghp_, JWTs, etc.) inside URLs are still
     # caught by _PREFIX_RE and _JWT_RE above. DB connection-string passwords
-    # are still caught by _DB_CONNSTR_RE.
+    # and URL userinfo passwords are still caught above.
+    if force and "?" in text and "=" in text:
+        text = _redact_url_query_params(text)
+        text = _redact_http_request_target_query_params(text)
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     if "&" in text and "=" in text:
