@@ -147,20 +147,40 @@ def _kanban_config(board: Optional[str] = None) -> dict:
     return merged
 
 
-def review_gate_enabled() -> bool:
+_CONNECTION_BOARD_BY_ID: dict[int, str] = {}
+
+
+def _board_overrides_kanban_key(board: Optional[str], *keys: str) -> bool:
+    """Return True when board metadata explicitly overrides any config key."""
+    if not board:
+        return False
+    try:
+        meta = read_board_metadata(board)
+    except Exception:
+        return False
+    for section in ("kanban", "dispatcher"):
+        overrides = meta.get(section)
+        if isinstance(overrides, dict) and any(key in overrides for key in keys):
+            return True
+    return False
+
+
+def review_gate_enabled(*, board: Optional[str] = None) -> bool:
     """Return True when worker completion must pass through Review first."""
     env = os.environ.get("HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE")
-    if env is not None:
+    if env is not None and not _board_overrides_kanban_key(board, "require_review_before_done"):
         return _truthy(env)
-    return _truthy(_kanban_config().get("require_review_before_done"))
+    return _truthy(_kanban_config(board).get("require_review_before_done"))
 
 
-def merge_captain_profile() -> str:
+def merge_captain_profile(*, board: Optional[str] = None) -> str:
     """Profile that owns Review-column / merge-train work."""
     env = os.environ.get("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE")
-    if env and env.strip():
+    if env and env.strip() and not _board_overrides_kanban_key(
+        board, "merge_captain_profile", "merge_train_operator_profile", "review_assignee"
+    ):
         return env.strip()
-    cfg = _kanban_config()
+    cfg = _kanban_config(board)
     for key in ("merge_captain_profile", "merge_train_operator_profile", "review_assignee"):
         value = cfg.get(key)
         if value and str(value).strip():
@@ -168,15 +188,24 @@ def merge_captain_profile() -> str:
     return "merge-captain"
 
 
-def review_agent_skills() -> list[str]:
+def review_agent_skills(*, board: Optional[str] = None) -> list[str]:
     """Skills to force-load for the Review-column merge captain."""
-    cfg = _kanban_config()
+    cfg = _kanban_config(board)
     value = cfg.get("review_agent_skills")
     if isinstance(value, str):
         return [part.strip() for part in value.split(",") if part.strip()]
     if isinstance(value, (list, tuple)):
         return [str(part).strip() for part in value if str(part).strip()]
     return ["github/cursor-bugbot-sweep", "github/github-pr-workflow"]
+
+
+def _board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    return _CONNECTION_BOARD_BY_ID.get(id(conn)) or _normalize_board_slug(
+        os.environ.get("HERMES_KANBAN_BOARD")
+    )
+
+
+# ---------------------------------------------------------------------------
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -1355,8 +1384,10 @@ def connect(
     """
     if db_path is not None:
         path = db_path
+        board_slug = _normalize_board_slug(board)
     else:
-        path = kanban_db_path(board=board)
+        board_slug = _normalize_board_slug(board) or get_current_board()
+        path = kanban_db_path(board=board_slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
@@ -1404,6 +1435,8 @@ def connect(
         except Exception:
             conn.close()
             raise
+    if board_slug:
+        _CONNECTION_BOARD_BY_ID[id(conn)] = board_slug
     return conn
 
 
@@ -1436,6 +1469,7 @@ def connect_closing(
     try:
         yield conn
     finally:
+        _CONNECTION_BOARD_BY_ID.pop(id(conn), None)
         try:
             conn.close()
         except Exception:
@@ -3263,6 +3297,7 @@ def complete_task(
     else:
         verified_cards = []
 
+    board = _board_for_connection(conn)
     route_to_review = False
     with write_txn(conn):
         task_row = conn.execute(
@@ -3272,13 +3307,13 @@ def complete_task(
         if not task_row:
             return False
         run_for_gate = expected_run_id if expected_run_id is not None else task_row["current_run_id"]
-        route_to_review = review_gate_enabled() and not _run_started_from_review(
+        route_to_review = review_gate_enabled(board=board) and not _run_started_from_review(
             conn, task_id, int(run_for_gate) if run_for_gate is not None else None
         )
         effective_metadata = metadata
         if route_to_review:
             original_assignee = task_row["assignee"]
-            review_assignee = merge_captain_profile()
+            review_assignee = merge_captain_profile(board=board)
             if effective_metadata is None:
                 effective_metadata = {}
             else:
@@ -3386,7 +3421,7 @@ def complete_task(
             completed_payload["verified_cards"] = verified_cards
         if route_to_review:
             completed_payload["implementation_assignee"] = task_row["assignee"]
-            completed_payload["review_assignee"] = merge_captain_profile()
+            completed_payload["review_assignee"] = merge_captain_profile(board=board)
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -5950,7 +5985,7 @@ def _ensure_fresh_base_for_implementation(
             "checkout or provide an existing absolute worktree path."
         )
 
-    base_branch = _kanban_str_config("implementation_base_branch", "main")
+    base_branch = _kanban_str_config("implementation_base_branch", "main", board=board)
     fetch = _run_git(repo, ["fetch", "origin", base_branch])
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout or "unknown git fetch failure").strip()
@@ -6371,7 +6406,7 @@ def dispatch_once(
         # missing skills against the review profile's Hermes home, so this can
         # safely name the operator workflow without making missing optional
         # skills fatal on profiles that do not have a local copy.
-        claimed.skills = review_agent_skills()
+        claimed.skills = review_agent_skills(board=board)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -6744,9 +6779,9 @@ def _default_spawn(
     # Review-column blocks as sticky Blocked and skip the Review protocol text.
     env.setdefault(
         "HERMES_KANBAN_REQUIRE_REVIEW_BEFORE_DONE",
-        "1" if review_gate_enabled() else "0",
+        "1" if review_gate_enabled(board=board) else "0",
     )
-    env.setdefault("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", merge_captain_profile())
+    env.setdefault("HERMES_KANBAN_MERGE_CAPTAIN_PROFILE", merge_captain_profile(board=board))
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -6773,7 +6808,7 @@ def _default_spawn(
     if task.workspace_kind == "worktree":
         env["HERMES_KANBAN_BRANCH"] = _implementation_branch_name(task)
         env["HERMES_KANBAN_BASE_BRANCH"] = _kanban_str_config(
-            "implementation_base_branch", "main",
+            "implementation_base_branch", "main", board=board,
         )
     elif task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -6986,6 +7021,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+    board = _board_for_connection(conn)
 
     def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""
@@ -7020,7 +7056,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
 
     review_run = _run_started_from_review(conn, task_id, task.current_run_id)
-    if review_gate_enabled() or review_run:
+    if review_gate_enabled(board=board) or review_run:
         if review_run:
             handoff = _latest_review_handoff(conn, task_id)
             implementation_assignee = handoff.get("implementation_assignee") or "(unknown)"
@@ -7048,11 +7084,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(
                 "When implementation is complete, call kanban_complete with PR/branch/test "
                 "handoff details. The kernel will move this card to Review and assign it to "
-                f"the merge captain ({merge_captain_profile()}); implementation workers must "
+                f"the merge captain ({merge_captain_profile(board=board)}); implementation workers must "
                 "not bypass Review or merge their own parallel PRs."
             )
             if task.workspace_kind == "worktree":
-                base_branch = _kanban_str_config("implementation_base_branch", "main")
+                base_branch = _kanban_str_config("implementation_base_branch", "main", board=board)
                 lines.append(
                     "Fresh-base worktree start is required: fetch origin, base/rebase "
                     f"{_implementation_branch_name(task)!r} on the current origin/{base_branch}, "
