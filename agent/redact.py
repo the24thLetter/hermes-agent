@@ -155,6 +155,13 @@ _JWT_RE = re.compile(
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
+# Web URL userinfo: scheme://user:password@host. Query strings stay intact,
+# but userinfo passwords are credentials and should never appear in logs.
+_URL_USERINFO_RE = re.compile(
+    r"((?:https?|wss?|ftp)://[^/\s:@]+:)([^/\s@]+)(@)",
+    re.IGNORECASE,
+)
+
 # Form-urlencoded body detection: conservative — only applies when the entire
 # text looks like a query string (k=v&k=v pattern with no newlines).
 _FORM_BODY_RE = re.compile(
@@ -260,6 +267,11 @@ def _redact_form_body(text: str) -> str:
     return _redact_query_string(text.strip())
 
 
+def _redact_url_userinfo(text: str) -> str:
+    """Strip passwords from HTTP/WS/FTP URL userinfo."""
+    return _URL_USERINFO_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -331,19 +343,20 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
 
-    # Database connection string passwords
+    # Database connection string passwords and web URL userinfo passwords
     if "://" in text:
         text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+        text = _redact_url_userinfo(text)
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:
         text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
 
-    # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log
-    # request targets) is intentionally OFF. Many legitimate workflows pass
-    # opaque tokens through query strings — magic-link checkouts, OAuth
-    # callbacks the agent is meant to follow, pre-signed share URLs — and
-    # blanket-redacting param values by name breaks those skills mid-flow.
+    # NOTE: Web-URL query-param and HTTP access-log request-target redaction is
+    # intentionally OFF. Many legitimate workflows pass opaque tokens through
+    # query strings — magic-link checkouts, OAuth callbacks the agent is meant
+    # to follow, pre-signed share URLs — and blanket-redacting param values by
+    # name breaks those skills mid-flow. URL userinfo passwords remain redacted.
     # Known credential shapes (sk-, ghp_, JWTs, etc.) inside URLs are still
     # caught by _PREFIX_RE and _JWT_RE above. DB connection-string passwords
     # are still caught by _DB_CONNSTR_RE.
