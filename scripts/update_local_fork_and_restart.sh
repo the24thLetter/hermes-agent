@@ -13,6 +13,8 @@ TARGET_BRANCH="openclaw/local-main"
 LAUNCHD_DOMAIN="gui/$(id -u)"
 LAUNCHAGENT_SERVICE="$LAUNCHD_DOMAIN/ai.hermes.gateway"
 LAUNCHAGENT_PLIST="/Users/xavierdavis/Library/LaunchAgents/ai.hermes.gateway.plist"
+DASHBOARD_LABEL="ai.hermes.dashboard"
+DASHBOARD_SERVICE="$LAUNCHD_DOMAIN/$DASHBOARD_LABEL"
 EXPECTED_GATEWAY_USER="$(id -un)"
 LEGACY_OPENCLAW_LAUNCHDAEMON_LABEL="system/ai.hermes.gateway.openclaw"
 LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST="/Library/LaunchDaemons/ai.hermes.gateway.openclaw.plist"
@@ -393,12 +395,18 @@ verify_no_standalone_kanban_daemon() {
 }
 
 restart_dashboard() {
-  log "restarting dashboard with canonical HERMES_HOME and no HERMES_KANBAN_BOARD"
+  log "restarting dashboard under launchd with canonical HERMES_HOME and no HERMES_KANBAN_BOARD"
   run mkdir -p "$HERMES_HOME/logs"
-  if pgrep -f '[h]ermes.*dashboard.*--no-open' >/dev/null 2>&1; then
-    run pkill -f '[h]ermes.*dashboard.*--no-open'
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ launchctl remove %q || true\n' "$DASHBOARD_LABEL"
+  else
+    launchctl remove "$DASHBOARD_LABEL" >/dev/null 2>&1 || true
   fi
-  run_shell "cd $(printf '%q' "$(pwd)") && nohup env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes dashboard --no-open --skip-build > $(printf '%q' "$HERMES_HOME/logs/dashboard.log") 2>&1 < /dev/null & printf '%s\n' \$! > $(printf '%q' "$HERMES_HOME/dashboard.pid")"
+  run launchctl submit \
+    -l "$DASHBOARD_LABEL" \
+    -o "$HERMES_HOME/logs/dashboard.log" \
+    -e "$HERMES_HOME/logs/dashboard.error.log" \
+    -- /usr/bin/env -u HERMES_KANBAN_BOARD "HERMES_HOME=$HERMES_HOME" "$(pwd)/venv/bin/hermes" dashboard --no-open --skip-build
 }
 
 launchagent_pid() {
@@ -596,13 +604,16 @@ verify_kanban_boards_and_stats() {
 
 verify_dashboard_http() {
   log "verifying dashboard HTTP 200 at $DASHBOARD_URL"
-  local code
+  local code dashboard_pid
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '+ curl -fsS -o /dev/null -w %%{http_code} %q\n' "$DASHBOARD_URL"
     return 0
   fi
   code="$(curl -fsS -o /dev/null -w '%{http_code}' "$DASHBOARD_URL")"
   [ "$code" = "200" ] || die "dashboard returned HTTP $code"
+  sleep 2
+  dashboard_pid="$(launchctl print "$DASHBOARD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / {print $2; exit}' | tr -d '[:space:]' || true)"
+  [ -n "$dashboard_pid" ] || die "dashboard returned HTTP 200 but launchd no longer reports a live dashboard pid"
   log "dashboard returned HTTP 200"
 }
 
