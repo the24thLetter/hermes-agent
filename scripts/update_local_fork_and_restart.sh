@@ -220,6 +220,15 @@ reinstall_editable_deps() {
   fi
 }
 
+build_dashboard_dist() {
+  log "rebuilding dashboard web dist before --skip-build launch"
+  if ! command -v npm >/dev/null 2>&1; then
+    die "npm not found; cannot rebuild dashboard web dist"
+  fi
+  run npm run build --workspace web
+  [ -f hermes_cli/web_dist/index.html ] || die "dashboard web dist missing after build"
+}
+
 migrate_and_check_config() {
   log "running Hermes config migrate/check"
   run env HERMES_HOME="$HERMES_HOME" ./venv/bin/hermes config migrate
@@ -662,6 +671,7 @@ main() {
   backup_hermes_state
   run_git_helper
   reinstall_editable_deps
+  build_dashboard_dist
   migrate_and_check_config
   set_scalar_config
   verify_review_agent_skills_yaml
