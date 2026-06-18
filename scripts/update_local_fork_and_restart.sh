@@ -663,6 +663,7 @@ post_upgrade_verification() {
   verify_gateway_status
   verify_kanban_dispatcher_ticks
   verify_kanban_boards_and_stats
+  restart_dashboard
   verify_dashboard_http
   verify_no_new_sqlite_wal_errors
   if [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ]; then
@@ -685,7 +686,6 @@ main() {
   set_scalar_config
   verify_review_agent_skills_yaml
   restart_gateway
-  restart_dashboard
   post_upgrade_verification
   log "local fork update/restart workflow complete"
 }
