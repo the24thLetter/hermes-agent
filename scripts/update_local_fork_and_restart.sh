@@ -398,7 +398,7 @@ restart_dashboard() {
   if pgrep -f '[h]ermes.*dashboard.*--no-open' >/dev/null 2>&1; then
     run pkill -f '[h]ermes.*dashboard.*--no-open'
   fi
-  run_shell "cd $(printf '%q' "$(pwd)") && env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes dashboard --no-open --skip-build > $(printf '%q' "$HERMES_HOME/logs/dashboard.log") 2>&1 &"
+  run_shell "cd $(printf '%q' "$(pwd)") && nohup env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes dashboard --no-open --skip-build > $(printf '%q' "$HERMES_HOME/logs/dashboard.log") 2>&1 < /dev/null & printf '%s\n' \$! > $(printf '%q' "$HERMES_HOME/dashboard.pid")"
 }
 
 launchagent_pid() {
