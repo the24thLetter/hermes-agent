@@ -86,7 +86,7 @@ run_shell() {
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '+ %s\n' "$*"
   else
-    bash -lc "$*"
+    bash -c "$*"
   fi
 }
 
@@ -416,6 +416,24 @@ gateway_pids_for_user() {
   ' || true
 }
 
+wait_for_gateway_supervisor_artifacts() {
+  local start pids count launchagent_pid_value
+  start="$(date +%s)"
+  while [ $(( $(date +%s) - start )) -lt 30 ]; do
+    launchagent_pid_value="$(launchagent_pid)"
+    pids="$(gateway_pids_for_user "$EXPECTED_GATEWAY_USER")"
+    count="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+    if [ -n "$launchagent_pid_value" ] && \
+       [ "$count" = "1" ] && \
+       [ "$pids" = "$launchagent_pid_value" ] && \
+       [ -f "$HERMES_HOME/gateway.pid" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 verify_no_legacy_openclaw_gateway() {
   log "checking that legacy openclaw system gateway is disabled"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -454,6 +472,7 @@ verify_gateway_process() {
     else
       printf '+ launchctl print %q  # read LaunchAgent pid\n' "$LAUNCHAGENT_SERVICE"
       printf '+ ps -axo pid=,user=,command=  # assert one %q gateway pid matches LaunchAgent\n' "$EXPECTED_GATEWAY_USER"
+      printf '+ wait up to 30s for %q/gateway.pid\n' "$HERMES_HOME"
       printf '+ test %q/gateway.pid matches LaunchAgent pid\n' "$HERMES_HOME"
     fi
     return 0
@@ -465,6 +484,7 @@ verify_gateway_process() {
   fi
 
   local pids count launchagent_pid_value pid_file_pid user
+  wait_for_gateway_supervisor_artifacts || warn "gateway supervisor artifacts did not settle before final PID checks"
   launchagent_pid_value="$(launchagent_pid)"
   [ -n "$launchagent_pid_value" ] || die "could not determine LaunchAgent gateway pid"
   pids="$(gateway_pids_for_user "$EXPECTED_GATEWAY_USER")"
