@@ -613,16 +613,25 @@ verify_kanban_boards_and_stats() {
 
 verify_dashboard_http() {
   log "verifying dashboard HTTP 200 at $DASHBOARD_URL"
-  local code dashboard_pid
+  local code dashboard_pid start
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '+ curl -fsS -o /dev/null -w %%{http_code} %q\n' "$DASHBOARD_URL"
+    printf '+ wait up to 30s for curl -fsS -o /dev/null -w %%{http_code} %q and live %q pid\n' "$DASHBOARD_URL" "$DASHBOARD_SERVICE"
     return 0
   fi
-  code="$(curl -fsS -o /dev/null -w '%{http_code}' "$DASHBOARD_URL")"
-  [ "$code" = "200" ] || die "dashboard returned HTTP $code"
-  sleep 2
+  start="$(date +%s)"
+  while [ $(( $(date +%s) - start )) -lt 30 ]; do
+    dashboard_pid="$(launchctl print "$DASHBOARD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / {print $2; exit}' | tr -d '[:space:]' || true)"
+    code="$(curl -fsS -o /dev/null -w '%{http_code}' "$DASHBOARD_URL" 2>/dev/null || true)"
+    if [ "$code" = "200" ] && [ -n "$dashboard_pid" ]; then
+      log "dashboard returned HTTP 200"
+      return 0
+    fi
+    sleep 1
+  done
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' "$DASHBOARD_URL" 2>/dev/null || true)"
   dashboard_pid="$(launchctl print "$DASHBOARD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / {print $2; exit}' | tr -d '[:space:]' || true)"
-  [ -n "$dashboard_pid" ] || die "dashboard returned HTTP 200 but launchd no longer reports a live dashboard pid"
+  [ -n "$dashboard_pid" ] || die "dashboard launchd service is not running"
+  [ "$code" = "200" ] || die "dashboard returned HTTP ${code:-unreachable}"
   log "dashboard returned HTTP 200"
 }
 
