@@ -8,12 +8,14 @@ set -euo pipefail
 # handles Hermes state backup, editable reinstall, continuity config, supervised
 # gateway restart, dashboard restart, and post-upgrade verification.
 
-DEFAULT_HERMES_HOME="/Users/openclaw/ai-os-migration/configs/hermes"
+DEFAULT_HERMES_HOME="/Users/xavierdavis/ai-os-migration/configs/hermes"
 TARGET_BRANCH="openclaw/local-main"
-SYSTEM_LAUNCHDAEMON_PLIST="/Library/LaunchDaemons/ai.hermes.gateway.openclaw.plist"
-SYSTEM_LAUNCHDAEMON_LABEL="system/ai.hermes.gateway.openclaw"
-GUI_LAUNCHAGENT_LABEL="gui/502/ai.hermes.gateway"
-GUI_LAUNCHAGENT_PLIST="/Users/openclaw/Library/LaunchAgents/ai.hermes.gateway.plist"
+LAUNCHD_DOMAIN="gui/$(id -u)"
+LAUNCHAGENT_SERVICE="$LAUNCHD_DOMAIN/ai.hermes.gateway"
+LAUNCHAGENT_PLIST="/Users/xavierdavis/Library/LaunchAgents/ai.hermes.gateway.plist"
+EXPECTED_GATEWAY_USER="$(id -un)"
+LEGACY_OPENCLAW_LAUNCHDAEMON_LABEL="system/ai.hermes.gateway.openclaw"
+LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST="/Library/LaunchDaemons/ai.hermes.gateway.openclaw.plist"
 DASHBOARD_URL="http://127.0.0.1:9119"
 DRY_RUN=0
 ALLOW_HERMES_HOME_OVERRIDE=0
@@ -40,9 +42,9 @@ Options:
 
 Safety rules encoded here:
   - scripts/update_local_fork.sh remains the only rebase/push helper invoked.
-  - Default HERMES_HOME must be /Users/openclaw/ai-os-migration/configs/hermes.
-  - The system LaunchDaemon is canonical: system/ai.hermes.gateway.openclaw.
-  - The GUI LaunchAgent gui/502/ai.hermes.gateway is not started or repaired.
+  - Default HERMES_HOME must be /Users/xavierdavis/ai-os-migration/configs/hermes.
+  - The user LaunchAgent gui/$(id -u)/ai.hermes.gateway is canonical.
+  - The legacy openclaw system LaunchDaemon must be disabled before live update.
   - Standalone Kanban daemon is never started; dispatch stays gateway-embedded.
   - Manual gateway run --replace fallback is live but unsupervised only:
     no launchd KeepAlive, no boot/login restart, and no automatic crash recovery.
@@ -264,6 +266,11 @@ PY
 
 verify_config_values() {
   log "verifying continuity config values"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ HERMES_HOME=%q ./venv/bin/python - <<%s\n' "$HERMES_HOME" "'PY'"
+    printf '  # assert continuity config values after live config set commands\n'
+    return 0
+  fi
   env HERMES_HOME="$HERMES_HOME" ./venv/bin/python - <<'PY'
 import os
 import sys
@@ -301,9 +308,9 @@ print("continuity config verified")
 PY
 }
 
-launchdaemon_plist_ok() {
-  [ -f "$SYSTEM_LAUNCHDAEMON_PLIST" ] || return 1
-  PLIST_PATH="$SYSTEM_LAUNCHDAEMON_PLIST" EXPECTED_HOME="$DEFAULT_HERMES_HOME" ./venv/bin/python - <<'PY'
+launchagent_plist_ok() {
+  [ -f "$LAUNCHAGENT_PLIST" ] || return 1
+  PLIST_PATH="$LAUNCHAGENT_PLIST" EXPECTED_HOME="$DEFAULT_HERMES_HOME" ./venv/bin/python - <<'PY'
 import os
 import plistlib
 import sys
@@ -314,13 +321,13 @@ expected_home = os.environ["EXPECTED_HOME"]
 try:
     data = plistlib.loads(plist_path.read_bytes())
 except Exception as exc:
-    print(f"invalid LaunchDaemon plist: {exc}", file=sys.stderr)
+    print(f"invalid LaunchAgent plist: {exc}", file=sys.stderr)
     sys.exit(1)
 errors = []
-if data.get("Label") != "ai.hermes.gateway.openclaw":
-    errors.append("Label must be ai.hermes.gateway.openclaw")
-if data.get("UserName") != "openclaw":
-    errors.append("UserName must be openclaw")
+if data.get("Label") != "ai.hermes.gateway":
+    errors.append("Label must be ai.hermes.gateway")
+if data.get("UserName"):
+    errors.append("user LaunchAgent must not set UserName")
 env = data.get("EnvironmentVariables") or {}
 args = data.get("ProgramArguments") or []
 script_text = ""
@@ -335,7 +342,7 @@ for arg in args:
 plist_home = env.get("HERMES_HOME")
 wrapper_exports_home = f"HERMES_HOME={expected_home}" in script_text or f"HERMES_HOME=\"{expected_home}\"" in script_text
 if plist_home != expected_home and not wrapper_exports_home:
-    errors.append("LaunchDaemon must set canonical HERMES_HOME directly or through its ProgramArguments wrapper")
+    errors.append("LaunchAgent must set canonical HERMES_HOME directly or through its ProgramArguments wrapper")
 args_joined = " ".join(str(arg) for arg in args)
 direct_gateway = "gateway run --replace" in args_joined
 wrapper_gateway = "gateway run --replace" in script_text and ("hermes_cli.main" in script_text or "bin/hermes" in script_text or "./venv/bin/hermes" in script_text)
@@ -345,38 +352,34 @@ if errors:
     for error in errors:
         print(error, file=sys.stderr)
     sys.exit(1)
-print("system LaunchDaemon plist verified")
+print("user LaunchAgent plist verified")
 PY
 }
 
-system_launchdaemon_available() {
-  launchdaemon_plist_ok || return 1
-  launchctl print "$SYSTEM_LAUNCHDAEMON_LABEL" >/dev/null 2>&1
-}
-
-verify_gui_launchagent_unloaded() {
-  log "verifying GUI LaunchAgent remains unloaded: $GUI_LAUNCHAGENT_LABEL"
-  if launchctl print "$GUI_LAUNCHAGENT_LABEL" >/dev/null 2>&1; then
-    die "GUI LaunchAgent is loaded; leaving it untouched but failing because canonical supervision is the system LaunchDaemon"
-  fi
-  log "GUI LaunchAgent is unloaded as required"
+launchagent_available() {
+  launchagent_plist_ok || return 1
+  launchctl print "$LAUNCHAGENT_SERVICE" >/dev/null 2>&1
 }
 
 restart_gateway() {
-  log "verifying canonical system LaunchDaemon before gateway restart"
-  if system_launchdaemon_available; then
-    log "system LaunchDaemon is available; restarting it without touching GUI LaunchAgent"
-    run launchctl kickstart -k "$SYSTEM_LAUNCHDAEMON_LABEL"
+  log "verifying canonical user LaunchAgent before gateway restart"
+  if launchagent_available; then
+    log "user LaunchAgent is available; restarting $LAUNCHAGENT_SERVICE"
+    run launchctl kickstart -k "$LAUNCHAGENT_SERVICE"
+    MANUAL_GATEWAY_FALLBACK=0
+  elif launchagent_plist_ok; then
+    log "user LaunchAgent is installed but not loaded; bootstrapping $LAUNCHAGENT_SERVICE"
+    run launchctl bootstrap "$LAUNCHD_DOMAIN" "$LAUNCHAGENT_PLIST"
+    run launchctl kickstart -k "$LAUNCHAGENT_SERVICE"
     MANUAL_GATEWAY_FALLBACK=0
   else
-    warn "system LaunchDaemon unavailable; using manual gateway fallback"
+    warn "user LaunchAgent unavailable; using manual gateway fallback"
     warn "manual fallback is live but unsupervised: no launchd KeepAlive, no boot/login restart, and no automatic crash recovery"
     MANUAL_GATEWAY_FALLBACK=1
     run mkdir -p "$HERMES_HOME/logs"
     run_shell "cd $(printf '%q' "$(pwd)") && env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes gateway run --replace > $(printf '%q' "$HERMES_HOME/logs/gateway.manual-fallback.log") 2>&1 &"
     GATEWAY_MANUAL_FALLBACK_LOG_OFFSET=0
   fi
-  verify_gui_launchagent_unloaded
 }
 
 verify_no_standalone_kanban_daemon() {
@@ -398,26 +401,79 @@ restart_dashboard() {
   run_shell "cd $(printf '%q' "$(pwd)") && env -u HERMES_KANBAN_BOARD HERMES_HOME=$(printf '%q' "$HERMES_HOME") ./venv/bin/hermes dashboard --no-open > $(printf '%q' "$HERMES_HOME/logs/dashboard.log") 2>&1 &"
 }
 
-launchdaemon_pid() {
-  launchctl print "$SYSTEM_LAUNCHDAEMON_LABEL" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / {print $2; exit}' | tr -d '[:space:]'
+launchagent_pid() {
+  launchctl print "$LAUNCHAGENT_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / {print $2; exit}' | tr -d '[:space:]'
 }
 
-verify_gateway_process() {
-  if [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ]; then
-    warn "manual gateway fallback is active; skipping LaunchDaemon PID equivalence check"
+gateway_pids_for_user() {
+  local expected_user="$1"
+  ps -axo pid=,user=,command= | awk -v expected_user="$expected_user" '
+    $2 == expected_user &&
+    $0 ~ /gateway run --replace/ &&
+    ($0 ~ /hermes_cli[.]main/ || $0 ~ /\/bin\/hermes/) {
+      print $1
+    }
+  ' || true
+}
+
+verify_no_legacy_openclaw_gateway() {
+  log "checking that legacy openclaw system gateway is disabled"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ launchctl print %q\n' "$LEGACY_OPENCLAW_LAUNCHDAEMON_LABEL"
+    printf '+ test ! -e %q\n' "$LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST"
+    printf '+ ps -axo pid=,user=,command= | awk %q\n' 'openclaw gateway run --replace check'
     return 0
   fi
 
-  local pids count daemon_pid pid_file_pid user
-  daemon_pid="$(launchdaemon_pid)"
-  [ -n "$daemon_pid" ] || die "could not determine LaunchDaemon gateway pid"
-  pids="$(ps -axo pid=,command= | awk '$0 ~ /hermes_cli[.]main/ && $0 ~ /gateway run --replace/ {print $1}' || true)"
-  count="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
-  [ "$count" = "1" ] || die "expected exactly one hermes_cli.main gateway process, found $count"
-  [ "$pids" = "$daemon_pid" ] || die "gateway process pid $pids does not match LaunchDaemon pid $daemon_pid"
+  local legacy_loaded=0 legacy_pids=""
+  if launchctl print "$LEGACY_OPENCLAW_LAUNCHDAEMON_LABEL" >/dev/null 2>&1; then
+    legacy_loaded=1
+  fi
+  legacy_pids="$(gateway_pids_for_user openclaw)"
 
-  user="$(ps -o user= -p "$daemon_pid" | tr -d '[:space:]')"
-  [ "$user" = "openclaw" ] || die "gateway process user is $user, expected openclaw"
+  if [ "$legacy_loaded" -eq 1 ] || [ -e "$LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST" ] || [ -n "$legacy_pids" ]; then
+    {
+      printf 'Legacy openclaw Hermes gateway is still installed or running.\n'
+      printf 'Disable it with admin privileges, then rerun this updater:\n'
+      printf '  sudo launchctl bootout system %q 2>/dev/null || true\n' "$LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST"
+      printf '  sudo mv %q %q\n' "$LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST" "${LEGACY_OPENCLAW_LAUNCHDAEMON_PLIST}.disabled"
+      if [ -n "$legacy_pids" ]; then
+        printf 'Detected legacy openclaw gateway pid(s): %s\n' "$legacy_pids"
+      fi
+    } >&2
+    die "legacy openclaw gateway must be disabled before live update"
+  fi
+
+  log "legacy openclaw system gateway is disabled"
+}
+
+verify_gateway_process() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ]; then
+      warn "manual gateway fallback would be active; skipping LaunchAgent PID equivalence check"
+    else
+      printf '+ launchctl print %q  # read LaunchAgent pid\n' "$LAUNCHAGENT_SERVICE"
+      printf '+ ps -axo pid=,user=,command=  # assert one %q gateway pid matches LaunchAgent\n' "$EXPECTED_GATEWAY_USER"
+      printf '+ test %q/gateway.pid matches LaunchAgent pid\n' "$HERMES_HOME"
+    fi
+    return 0
+  fi
+
+  if [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ]; then
+    warn "manual gateway fallback is active; skipping LaunchAgent PID equivalence check"
+    return 0
+  fi
+
+  local pids count launchagent_pid_value pid_file_pid user
+  launchagent_pid_value="$(launchagent_pid)"
+  [ -n "$launchagent_pid_value" ] || die "could not determine LaunchAgent gateway pid"
+  pids="$(gateway_pids_for_user "$EXPECTED_GATEWAY_USER")"
+  count="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  [ "$count" = "1" ] || die "expected exactly one $EXPECTED_GATEWAY_USER Hermes gateway process, found $count"
+  [ "$pids" = "$launchagent_pid_value" ] || die "gateway process pid $pids does not match LaunchAgent pid $launchagent_pid_value"
+
+  user="$(ps -o user= -p "$launchagent_pid_value" | tr -d '[:space:]')"
+  [ "$user" = "$EXPECTED_GATEWAY_USER" ] || die "gateway process user is $user, expected $EXPECTED_GATEWAY_USER"
 
   if [ -f "$HERMES_HOME/gateway.pid" ]; then
     pid_file_pid="$(PID_FILE="$HERMES_HOME/gateway.pid" ./venv/bin/python - <<'PY'
@@ -431,25 +487,25 @@ except json.JSONDecodeError:
     print(raw)
 PY
 )"
-    [ "$pid_file_pid" = "$daemon_pid" ] || die "gateway.pid points to $pid_file_pid, expected live LaunchDaemon pid $daemon_pid"
+    [ "$pid_file_pid" = "$launchagent_pid_value" ] || die "gateway.pid points to $pid_file_pid, expected live LaunchAgent pid $launchagent_pid_value"
   else
     die "missing gateway.pid at $HERMES_HOME/gateway.pid"
   fi
 
-  log "gateway supervisor verified: pid=$daemon_pid user=openclaw HERMES_HOME=$HERMES_HOME"
+  log "gateway supervisor verified: pid=$launchagent_pid_value user=$EXPECTED_GATEWAY_USER HERMES_HOME=$HERMES_HOME"
 }
 
 verify_gateway_status() {
-  log "verifying gateway status and Telegram connection"
+  log "verifying gateway status"
   run env HERMES_HOME="$HERMES_HOME" ./venv/bin/hermes gateway status
-  verify_telegram_connection
+  verify_gateway_runtime_state
 }
 
-verify_telegram_connection() {
-  log "asserting Telegram platform is connected from gateway runtime status"
+verify_gateway_runtime_state() {
+  log "asserting gateway runtime status is running"
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '+ HERMES_HOME=%q ./venv/bin/python - <<%s\n' "$HERMES_HOME" "'PY'"
-    printf '  # assert gateway_state.json platforms.telegram.state == connected (non-secret)\n'
+    printf '  # assert gateway_state.json gateway_state == running (non-secret)\n'
     return 0
   fi
   env HERMES_HOME="$HERMES_HOME" ./venv/bin/python - <<'PY'
@@ -468,18 +524,15 @@ except json.JSONDecodeError as exc:
     print(f"invalid gateway runtime status JSON: {exc}", file=sys.stderr)
     sys.exit(1)
 
-platforms = payload.get("platforms") or {}
-telegram = platforms.get("telegram") or {}
-state = telegram.get("state")
-if state != "connected":
-    code = telegram.get("error_code") or "none"
+state = payload.get("gateway_state")
+if state != "running":
     print(
-        "Telegram platform is not connected "
-        f"(state={state!r}, error_code={code!r}; message redacted)",
+        "Gateway runtime is not running "
+        f"(gateway_state={state!r})",
         file=sys.stderr,
     )
     sys.exit(1)
-print("Telegram platform connected")
+print("Gateway runtime state is running")
 PY
 }
 
@@ -549,10 +602,11 @@ verify_no_new_sqlite_wal_errors() {
 post_upgrade_verification() {
   log "running post-upgrade verification"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '+ launchctl print %q\n' "$SYSTEM_LAUNCHDAEMON_LABEL"
+    printf '+ launchctl print %q\n' "$LAUNCHAGENT_SERVICE"
   else
-    launchctl print "$SYSTEM_LAUNCHDAEMON_LABEL" >/dev/null || [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ] || die "system LaunchDaemon not printable"
+    launchctl print "$LAUNCHAGENT_SERVICE" >/dev/null || [ "$MANUAL_GATEWAY_FALLBACK" -eq 1 ] || die "user LaunchAgent not printable"
   fi
+  verify_no_legacy_openclaw_gateway
   verify_gateway_process
   verify_config_values
   verify_review_agent_skills_yaml
@@ -571,6 +625,7 @@ main() {
   parse_args "$@"
   cd "$(repo_root)"
   ensure_canonical_hermes_home
+  verify_no_legacy_openclaw_gateway
   record_gateway_error_offset
   ensure_clean_checkout
   backup_hermes_state

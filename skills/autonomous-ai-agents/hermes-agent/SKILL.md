@@ -14,6 +14,17 @@ metadata:
 
 # Hermes Agent
 
+## Xavier Migration Override
+
+As of 2026-06-18, Xavier's Hermes install has been migrated from the isolated
+`openclaw` macOS account into the `xavierdavis` account. For this machine,
+prefer `HERMES_HOME=/Users/xavierdavis/ai-os-migration/configs/hermes`,
+workspace `/Users/xavierdavis/hermes-workspace`, and the user LaunchAgent
+`/Users/xavierdavis/Library/LaunchAgents/ai.hermes.gateway.plist` after secrets
+and dependencies are restored. Do not treat the old `openclaw` user,
+`gui/502`, or `/Library/LaunchDaemons/ai.hermes.gateway.openclaw.plist` as
+canonical unless Xavier explicitly asks to operate the legacy isolated account.
+
 Hermes Agent is an open-source AI agent framework by Nous Research that runs in your terminal, messaging platforms, and IDEs. It belongs to the same category as Claude Code (Anthropic), Codex (OpenAI), and OpenClaw — autonomous coding and task-execution agents that use tool calling to interact with your system. Hermes works with any LLM provider (OpenRouter, Anthropic, OpenAI, DeepSeek, local models, and 15+ others) and runs on Linux, macOS, and WSL.
 
 What makes Hermes different:
