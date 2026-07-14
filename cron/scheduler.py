@@ -1448,6 +1448,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+    # no_agent promises script stdout is delivered verbatim. Preserve the
+    # global wrapper for normal cron jobs while honoring that narrower contract.
+    if job.get("no_agent"):
+        wrap_response = False
 
     if wrap_response:
         task_name = job.get("name", job["id"])
